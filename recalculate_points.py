@@ -188,11 +188,11 @@ def recalculate(dry_run: bool = False) -> None:
             item_info    = item_master.get(line["item_code"])
             earns_points = item_info["earns_points"] if item_info else 0
             points_rate  = item_info["points_rate"]  if item_info else 0.0
-            line_eligible = abs(line["line_amount"]) if earns_points else 0.0
+            line_eligible = abs(float(line["line_amount"])) if earns_points else 0.0
             eligible_amount += line_eligible
 
             if earns_points and contractor_id:
-                inv_points += calculate_points(line["line_amount"], points_rate)
+                inv_points += calculate_points(float(line["line_amount"]), points_rate)
 
             # Queue invoice_line snapshot update
             line_updates.append((
