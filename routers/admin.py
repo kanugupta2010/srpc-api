@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
 from database import get_connection as get_db_connection
 from models.schemas import ImportListResponse, ImportSummaryResponse
-from services.import_service import parse_csv, resolve_contractors
+from services.import_service import parse_file, resolve_contractors
 from services.points_engine import process_invoices
 
 log = logging.getLogger(__name__)
@@ -71,7 +71,7 @@ async def import_csv(
     try:
         # --- Parse CSV ---
         try:
-            invoices, parse_stats = parse_csv(content)
+            invoices, parse_stats = parse_file(content, file.filename)
         except ValueError as exc:
             _fail_batch(db, batch_id, str(exc))
             raise HTTPException(
