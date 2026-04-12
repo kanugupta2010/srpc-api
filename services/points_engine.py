@@ -2,22 +2,17 @@
 services/points_engine.py
 SRPC Enterprises Private Limited — Saraswati Loyalty Program
 
-Points engine — uses invoice_type and customer_type separately:
-  invoice_type = sale        → award points if contractor and eligible items
+Points engine:
+  invoice_type = sale        → award points if contractor + eligible items
   invoice_type = sale_return → deduct points via 'reversed' log entry
-  invoice_type = internal    → import invoice, no points
-  customer_type = walk_in    → import invoice, no points unless contractor matched
+  No invoice skipping — all invoices are imported regardless of type
 """
 
 import logging
 import math
 from datetime import datetime, timedelta
 
-from services.import_service import (
-    ParsedInvoice,
-    INV_SALE, INV_SALE_RETURN, INV_INTERNAL,
-    CUST_CONTRACTOR_DIRECT, CUST_CONTRACTOR_REFERRED,
-)
+from services.import_service import ParsedInvoice, INV_SALE_RETURN
 
 log = logging.getLogger(__name__)
 
@@ -117,7 +112,7 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
         ))
 
     # Determine points_status
-    points_status = "not_applicable"
+    points_status     = "not_applicable"
     contractor_status = None
 
     if inv.contractor_id:
@@ -125,22 +120,15 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
         row = cursor.fetchone()
         contractor_status = row["status"] if row else None
 
-    if inv.invoice_type == INV_INTERNAL:
+    if not inv.contractor_id:
         points_status = "not_applicable"
         total_points  = 0.0
-
-    elif not inv.contractor_id:
-        points_status = "not_applicable"
-        total_points  = 0.0
-
     elif contractor_status != "approved":
         points_status = "pending"
         total_points  = 0.0
-
     elif eligible_amount == 0 or total_points == 0:
         points_status = "skipped"
         total_points  = 0.0
-
     else:
         points_status = "credited"
 
@@ -163,7 +151,7 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
     ))
     invoice_id = cursor.lastrowid
 
-    # Also store customer_type — UPDATE after insert
+    # Store customer_type
     cursor.execute(
         "UPDATE invoices SET customer_type = %s WHERE id = %s",
         (inv.customer_type, invoice_id)
@@ -182,7 +170,6 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
     # Insert points_log entry
     if points_status == "credited" and total_points > 0 and inv.contractor_id:
         if inv.invoice_type == INV_SALE_RETURN:
-            # Deduct points
             cursor.execute("""
                 INSERT INTO points_log (
                     contractor_id, invoice_id, event_type,
@@ -196,7 +183,6 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
             ))
             counters["points_awarded"] -= total_points
         else:
-            # Award points
             expires_at = datetime.utcnow() + timedelta(days=expiry_days)
             cursor.execute("""
                 INSERT INTO points_log (
@@ -219,10 +205,10 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
 def _update_contractor_balance(cursor, contractor_id: int, settings: dict) -> None:
     cursor.execute("""
         SELECT
-            COALESCE(SUM(CASE WHEN event_type = 'earned'                 THEN points       ELSE 0 END), 0) AS total_earned,
-            COALESCE(SUM(CASE WHEN event_type = 'redeemed'               THEN ABS(points)  ELSE 0 END), 0) AS total_redeemed,
-            COALESCE(SUM(CASE WHEN event_type = 'expired'                THEN ABS(points)  ELSE 0 END), 0) AS total_expired,
-            COALESCE(SUM(CASE WHEN event_type IN ('reversed','adjusted') THEN points       ELSE 0 END), 0) AS total_adjustments
+            COALESCE(SUM(CASE WHEN event_type = 'earned'                 THEN points      ELSE 0 END), 0) AS total_earned,
+            COALESCE(SUM(CASE WHEN event_type = 'redeemed'               THEN ABS(points) ELSE 0 END), 0) AS total_redeemed,
+            COALESCE(SUM(CASE WHEN event_type = 'expired'                THEN ABS(points) ELSE 0 END), 0) AS total_expired,
+            COALESCE(SUM(CASE WHEN event_type IN ('reversed','adjusted') THEN points      ELSE 0 END), 0) AS total_adjustments
         FROM points_log WHERE contractor_id = %s
     """, (contractor_id,))
     row = cursor.fetchone()

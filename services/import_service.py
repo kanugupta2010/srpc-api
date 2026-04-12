@@ -5,8 +5,10 @@ SRPC Enterprises Private Limited — Saraswati Loyalty Program
 Invoice parser — reads Busy 21 XLSX or CSV export.
 
 Two separate identifiers per invoice:
-  invoice_type  → nature of transaction: sale | sale_return | internal
-  customer_type → who the customer is:   contractor_direct | contractor_referred | walk_in | not_applicable
+  invoice_type  → sale | sale_return          (nature of transaction)
+  customer_type → contractor_direct | contractor_referred | walk_in
+
+All invoices are imported — no invoices are skipped based on type.
 
 Busy 21 export columns:
   Date | Vch Type | Vch/Bill No | Particulars | Alias | Item Details |
@@ -52,13 +54,11 @@ VCH_RETURN = "SlRt"
 # invoice_type values
 INV_SALE        = "sale"
 INV_SALE_RETURN = "sale_return"
-INV_INTERNAL    = "internal"
 
 # customer_type values
 CUST_CONTRACTOR_DIRECT   = "contractor_direct"
 CUST_CONTRACTOR_REFERRED = "contractor_referred"
 CUST_WALK_IN             = "walk_in"
-CUST_NOT_APPLICABLE      = "not_applicable"
 
 REFERRED_BY_RE = re.compile(r"-\s*(\d{10,12})\s*$")
 
@@ -81,8 +81,8 @@ class ParsedLine:
 class ParsedInvoice:
     invoice_date:       Optional[date]
     bill_number:        str
-    invoice_type:       str            # sale | sale_return | internal
-    customer_type:      str            # contractor_direct | contractor_referred | walk_in | not_applicable
+    invoice_type:       str            # sale | sale_return
+    customer_type:      str            # contractor_direct | contractor_referred | walk_in
     particulars:        str
     party_name:         str
     party_mobile:       str
@@ -230,18 +230,11 @@ def _parse_rows(row_iter) -> tuple[list[ParsedInvoice], dict]:
             party_mobile_raw = _to_str(row.get(COL_PARTY_MOBILE, ""))
             party_mobile     = _clean_mobile(party_mobile_raw) if party_mobile_raw else ""
 
-            # --- Determine invoice_type ---
-            if vch_type == VCH_RETURN:
-                invoice_type = INV_SALE_RETURN
-            elif particulars.lower() == "self consumption of goods":
-                invoice_type = INV_INTERNAL
-            else:
-                invoice_type = INV_SALE
+            # invoice_type — based purely on Vch Type
+            invoice_type = INV_SALE_RETURN if vch_type == VCH_RETURN else INV_SALE
 
-            # --- Determine customer_type ---
-            if invoice_type == INV_INTERNAL:
-                customer_type = CUST_NOT_APPLICABLE
-            elif referred_by_mobile:
+            # customer_type — based on Referred By and Particulars
+            if referred_by_mobile:
                 customer_type = CUST_CONTRACTOR_REFERRED
             elif particulars.lower() not in ("cash", ""):
                 customer_type = CUST_CONTRACTOR_DIRECT
@@ -308,10 +301,6 @@ def resolve_contractors(invoices: list[ParsedInvoice], db_conn) -> None:
     cursor.close()
 
     for inv in invoices:
-        # internal invoices don't need contractor resolution
-        if inv.invoice_type == INV_INTERNAL:
-            continue
-
         contractor = None
 
         if inv.customer_type == CUST_CONTRACTOR_REFERRED:
@@ -330,7 +319,7 @@ def resolve_contractors(invoices: list[ParsedInvoice], db_conn) -> None:
                 if contractor:
                     inv.customer_type = CUST_CONTRACTOR_DIRECT
 
-        # For sale returns — same logic, try referred_by as fallback
+        # For sale returns — also try referred_by as fallback
         if not contractor and inv.is_return and inv.referred_by_mobile:
             contractor = mobile_map.get(inv.referred_by_mobile)
 
