@@ -14,7 +14,7 @@ from typing import List
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
-from database import get_db_connection
+from database import get_connection as get_db_connection
 from models.schemas import ImportListResponse, ImportSummaryResponse
 from services.import_service import parse_csv, resolve_contractors
 from services.points_engine import process_invoices
