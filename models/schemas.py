@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 class ImportSummaryResponse(BaseModel):
     """Response returned after a CSV import completes."""
-    batch_id:            int
+    id:                  int
     filename:            str
     status:              str
     total_rows:          int
