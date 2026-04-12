@@ -6,6 +6,9 @@ Points engine:
   invoice_type = sale        → award points if contractor + eligible items
   invoice_type = sale_return → deduct points via 'reversed' log entry
   No invoice skipping — all invoices are imported regardless of type
+
+Points base (how many rupees = 1 point unit) is read from settings table
+so it can be changed without redeployment.
 """
 
 import logging
@@ -35,9 +38,13 @@ def _load_item_master(cursor) -> dict:
     }
 
 
-def _calculate_points(amount: float, points_rate: float) -> float:
-    """FLOOR(abs(amount) / 100) × points_rate"""
-    return math.floor(abs(amount) / 100) * points_rate
+def _calculate_points(amount: float, points_rate: float, points_base: float) -> float:
+    """
+    FLOOR(abs(amount) / points_base) × points_rate
+    points_base comes from settings table (default 100)
+    e.g. amount=5400, points_rate=1.0, points_base=100 → FLOOR(54) × 1.0 = 54 points
+    """
+    return math.floor(abs(amount) / points_base) * points_rate
 
 
 def _calculate_tier(total_earned: float, settings: dict) -> str:
@@ -52,7 +59,8 @@ def process_invoices(invoices: list[ParsedInvoice], batch_id: int, db_conn) -> d
     cursor = db_conn.cursor(dictionary=True)
     settings    = _load_settings(cursor)
     item_master = _load_item_master(cursor)
-    expiry_days = int(settings.get("points_expiry_days", 365))
+    expiry_days  = int(settings.get("points_expiry_days", 365))
+    points_base  = float(settings.get("points_base", 100))
 
     counters = dict(
         invoices_imported=0, invoices_skipped=0,
@@ -64,7 +72,7 @@ def process_invoices(invoices: list[ParsedInvoice], batch_id: int, db_conn) -> d
     for inv in invoices:
         try:
             _process_single(inv, batch_id, cursor, item_master, expiry_days,
-                            counters, contractor_ids_to_update, error_notes)
+                            points_base, counters, contractor_ids_to_update, error_notes)
         except Exception as exc:
             log.error("Error on invoice %s: %s", inv.bill_number, exc)
             counters["errors"] += 1
@@ -80,7 +88,7 @@ def process_invoices(invoices: list[ParsedInvoice], batch_id: int, db_conn) -> d
 
 
 def _process_single(inv, batch_id, cursor, item_master, expiry_days,
-                    counters, contractor_ids_to_update, error_notes):
+                    points_base, counters, contractor_ids_to_update, error_notes):
 
     # Duplicate check
     cursor.execute("SELECT id FROM invoices WHERE bill_number = %s", (inv.bill_number,))
@@ -102,7 +110,7 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
         eligible_amount += line_eligible
 
         if earns_points and inv.contractor_id:
-            total_points += _calculate_points(line.line_amount, points_rate)
+            total_points += _calculate_points(line.line_amount, points_rate, points_base)
 
         line_data.append((
             line.item_code, line.item_name,

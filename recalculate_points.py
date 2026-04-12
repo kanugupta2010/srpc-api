@@ -100,8 +100,8 @@ def load_contractors(cursor) -> dict:
 # Points formula
 # ---------------------------------------------------------------------------
 
-def calculate_points(amount: float, points_rate: float) -> float:
-    return math.floor(abs(amount) / 100) * points_rate
+def calculate_points(amount: float, points_rate: float, points_base: float) -> float:
+    return math.floor(abs(amount) / points_base) * points_rate
 
 
 def calculate_tier(total_earned: float, settings: dict) -> str:
@@ -123,7 +123,8 @@ def recalculate(dry_run: bool = False) -> None:
     settings    = load_settings(cursor)
     item_master = load_item_master(cursor)
     contractors = load_contractors(cursor)
-    expiry_days = int(settings.get("points_expiry_days", 365))
+    expiry_days  = int(settings.get("points_expiry_days", 365))
+    points_base  = float(settings.get("points_base", 100))
 
     log.info("=" * 60)
     log.info("SRPC Points Recalculation — %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -192,7 +193,7 @@ def recalculate(dry_run: bool = False) -> None:
             eligible_amount += line_eligible
 
             if earns_points and contractor_id:
-                inv_points += calculate_points(float(line["line_amount"]), points_rate)
+                inv_points += calculate_points(float(line["line_amount"]), points_rate, points_base)
 
             # Queue invoice_line snapshot update
             line_updates.append((
