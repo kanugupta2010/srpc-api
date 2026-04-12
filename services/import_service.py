@@ -5,10 +5,12 @@ SRPC Enterprises Private Limited — Saraswati Loyalty Program
 Invoice parser — reads Busy 21 XLSX or CSV export.
 
 Two separate identifiers per invoice:
-  invoice_type  → sale | sale_return          (nature of transaction)
+  invoice_type  → sale | sale_return
   customer_type → contractor_direct | contractor_referred | walk_in
 
-All invoices are imported — no invoices are skipped based on type.
+Contractor matching — uses contractor_code only:
+  Referred By field → matched directly against contractors.contractor_code
+  Particulars field → matched directly against contractors.contractor_code
 
 Busy 21 export columns:
   Date | Vch Type | Vch/Bill No | Particulars | Alias | Item Details |
@@ -17,7 +19,6 @@ Busy 21 export columns:
 
 import csv
 import io
-import re
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -60,8 +61,6 @@ CUST_CONTRACTOR_DIRECT   = "contractor_direct"
 CUST_CONTRACTOR_REFERRED = "contractor_referred"
 CUST_WALK_IN             = "walk_in"
 
-REFERRED_BY_RE = re.compile(r"-\s*(\d{10,12})\s*$")
-
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -79,17 +78,16 @@ class ParsedLine:
 
 @dataclass
 class ParsedInvoice:
-    invoice_date:       Optional[date]
-    bill_number:        str
-    invoice_type:       str            # sale | sale_return
-    customer_type:      str            # contractor_direct | contractor_referred | walk_in
-    particulars:        str
-    party_name:         str
-    party_mobile:       str
-    referred_by_raw:    str
-    referred_by_mobile: Optional[str]
-    contractor_id:      Optional[int]
-    lines:              list = field(default_factory=list)
+    invoice_date:    Optional[date]
+    bill_number:     str
+    invoice_type:    str            # sale | sale_return
+    customer_type:   str            # contractor_direct | contractor_referred | walk_in
+    particulars:     str            # Busy 21 account name — used for contractor_code match
+    party_name:      str
+    party_mobile:    str
+    referred_by_raw: str            # Raw Referred By value — matched as contractor_code
+    contractor_id:   Optional[int]
+    lines:           list = field(default_factory=list)
 
     @property
     def is_return(self) -> bool:
@@ -140,24 +138,6 @@ def _parse_float(raw) -> float:
 
 def _to_str(raw) -> str:
     return "" if raw is None else str(raw).strip()
-
-
-def _extract_mobile_from_referred_by(raw: str) -> Optional[str]:
-    if not raw:
-        return None
-    m = REFERRED_BY_RE.search(raw.strip())
-    return m.group(1) if m else None
-
-
-def _clean_mobile(raw: str) -> str:
-    v = raw.strip().replace(" ", "").replace("-", "")
-    if v.startswith("+91"):
-        v = v[3:]
-    elif v.startswith("91") and len(v) == 12:
-        v = v[2:]
-    if v.startswith("0") and len(v) == 11:
-        v = v[1:]
-    return v
 
 
 def _get_qty(row: dict) -> float:
@@ -220,21 +200,15 @@ def _parse_rows(row_iter) -> tuple[list[ParsedInvoice], dict]:
         # New invoice header row
         if bill_no:
             stats["header_rows"] += 1
-            particulars = _to_str(row.get(COL_PARTICULARS, ""))
-
-            referred_by_raw    = _to_str(row.get(COL_REFERRED_BY, ""))
-            referred_by_mobile = _extract_mobile_from_referred_by(referred_by_raw)
-            if referred_by_mobile:
-                referred_by_mobile = _clean_mobile(referred_by_mobile)
-
-            party_mobile_raw = _to_str(row.get(COL_PARTY_MOBILE, ""))
-            party_mobile     = _clean_mobile(party_mobile_raw) if party_mobile_raw else ""
+            particulars     = _to_str(row.get(COL_PARTICULARS, ""))
+            referred_by_raw = _to_str(row.get(COL_REFERRED_BY, ""))
+            party_mobile    = _to_str(row.get(COL_PARTY_MOBILE, ""))
 
             # invoice_type — based purely on Vch Type
             invoice_type = INV_SALE_RETURN if vch_type == VCH_RETURN else INV_SALE
 
-            # customer_type — based on Referred By and Particulars
-            if referred_by_mobile:
+            # customer_type — referred_by takes priority, then particulars
+            if referred_by_raw:
                 customer_type = CUST_CONTRACTOR_REFERRED
             elif particulars.lower() not in ("cash", ""):
                 customer_type = CUST_CONTRACTOR_DIRECT
@@ -242,16 +216,15 @@ def _parse_rows(row_iter) -> tuple[list[ParsedInvoice], dict]:
                 customer_type = CUST_WALK_IN
 
             current = ParsedInvoice(
-                invoice_date       = _parse_date(row.get(COL_DATE)),
-                bill_number        = bill_no,
-                invoice_type       = invoice_type,
-                customer_type      = customer_type,
-                particulars        = particulars,
-                party_name         = _to_str(row.get(COL_PARTY_NAME, "")),
-                party_mobile       = party_mobile,
-                referred_by_raw    = referred_by_raw,
-                referred_by_mobile = referred_by_mobile,
-                contractor_id      = None,
+                invoice_date    = _parse_date(row.get(COL_DATE)),
+                bill_number     = bill_no,
+                invoice_type    = invoice_type,
+                customer_type   = customer_type,
+                particulars     = particulars,
+                party_name      = _to_str(row.get(COL_PARTY_NAME, "")),
+                party_mobile    = party_mobile,
+                referred_by_raw = referred_by_raw,
+                contractor_id   = None,
             )
             invoices.append(current)
 
@@ -281,47 +254,57 @@ def parse_file(content: bytes, filename: str) -> tuple[list[ParsedInvoice], dict
 
 
 # ---------------------------------------------------------------------------
-# Contractor resolver
+# Contractor resolver — matches by contractor_code only
 # ---------------------------------------------------------------------------
 
 def resolve_contractors(invoices: list[ParsedInvoice], db_conn) -> None:
-    """Resolves contractor_id for each invoice. Mutates in place."""
+    """
+    Resolves contractor_id for each invoice using contractor_code matching only.
+
+    contractor_referred → Referred By field = contractor_code
+    contractor_direct   → Particulars field = contractor_code
+    walk_in             → no contractor match attempted
+    """
     cursor = db_conn.cursor(dictionary=True)
     cursor.execute(
-        "SELECT id, contractor_code, mobile, status FROM contractors WHERE is_active = 1"
+        "SELECT id, contractor_code, status FROM contractors WHERE is_active = 1"
     )
     rows = cursor.fetchall()
-    mobile_map: dict[str, dict] = {}
-    code_map:   dict[str, dict] = {}
+
+    # Build lookup: contractor_code → contractor row
+    code_map: dict[str, dict] = {}
     for r in rows:
-        if r["mobile"]:
-            mobile_map[r["mobile"].strip()] = r
         if r["contractor_code"]:
             code_map[r["contractor_code"].strip()] = r
+
     cursor.close()
 
     for inv in invoices:
-        contractor = None
 
         if inv.customer_type == CUST_CONTRACTOR_REFERRED:
-            contractor = mobile_map.get(inv.referred_by_mobile or "")
-
-        elif inv.customer_type == CUST_CONTRACTOR_DIRECT:
-            contractor = code_map.get(inv.particulars)
-            if not contractor and inv.party_mobile:
-                contractor = mobile_map.get(inv.party_mobile)
-            if not contractor:
+            # Referred By field contains contractor_code directly
+            contractor = code_map.get(inv.referred_by_raw.strip())
+            if contractor:
+                inv.contractor_id = contractor["id"]
+            else:
+                # Referred By code not found — downgrade to walk_in
+                log.warning(
+                    "Invoice %s — Referred By code '%s' not found in contractors",
+                    inv.bill_number, inv.referred_by_raw,
+                )
                 inv.customer_type = CUST_WALK_IN
 
-        elif inv.customer_type == CUST_WALK_IN:
-            if inv.party_mobile:
-                contractor = mobile_map.get(inv.party_mobile)
-                if contractor:
-                    inv.customer_type = CUST_CONTRACTOR_DIRECT
+        elif inv.customer_type == CUST_CONTRACTOR_DIRECT:
+            # Particulars field contains contractor_code
+            contractor = code_map.get(inv.particulars.strip())
+            if contractor:
+                inv.contractor_id = contractor["id"]
+            else:
+                # Particulars code not found — downgrade to walk_in
+                log.warning(
+                    "Invoice %s — Particulars code '%s' not found in contractors",
+                    inv.bill_number, inv.particulars,
+                )
+                inv.customer_type = CUST_WALK_IN
 
-        # For sale returns — also try referred_by as fallback
-        if not contractor and inv.is_return and inv.referred_by_mobile:
-            contractor = mobile_map.get(inv.referred_by_mobile)
-
-        if contractor:
-            inv.contractor_id = contractor["id"]
+        # walk_in — no contractor resolution needed

@@ -14,9 +14,10 @@ When to run this:
 What it does:
   1. Clears all points_log entries of type 'earned' and 'reversed'
      (manual 'adjusted' entries are preserved)
-  2. Recalculates points for every credited/pending invoice
-  3. Rewrites points_log entries
-  4. Recomputes all contractor balances and tiers
+  2. Refreshes invoice_lines snapshots from current item_master
+  3. Recalculates eligible_amount and points_awarded on each invoice
+  4. Rewrites points_log entries
+  5. Recomputes all contractor balances and tiers
 
 Usage:
     python recalculate_points.py
@@ -91,7 +92,6 @@ def load_item_master(cursor) -> dict:
 
 
 def load_contractors(cursor) -> dict:
-    """Returns dict: contractor_id → status"""
     cursor.execute("SELECT id, status FROM contractors WHERE is_active = 1")
     return {r["id"]: r["status"] for r in cursor.fetchall()}
 
@@ -130,37 +130,32 @@ def recalculate(dry_run: bool = False) -> None:
     log.info("Dry run: %s", dry_run)
     log.info("=" * 60)
 
-    # --- Step 1: Load all invoices that could have points ---
+    # --- Step 1: Load all invoices ---
     cursor.execute("""
-        SELECT
-            i.id, i.bill_number, i.invoice_date, i.invoice_type,
-            i.contractor_id, i.points_credited_at
-        FROM invoices i
-        WHERE i.contractor_id IS NOT NULL
-        ORDER BY i.invoice_date ASC, i.id ASC
+        SELECT id, bill_number, invoice_date, invoice_type,
+               contractor_id, points_credited_at
+        FROM invoices
+        ORDER BY invoice_date ASC, id ASC
     """)
     invoices = cursor.fetchall()
-    log.info("Invoices with contractor attribution: %d", len(invoices))
+    log.info("Total invoices: %d", len(invoices))
 
     # --- Step 2: Load all invoice lines ---
     cursor.execute("""
-        SELECT il.invoice_id, il.item_code, il.line_amount
-        FROM invoice_lines il
-        JOIN invoices i ON i.id = il.invoice_id
-        WHERE i.contractor_id IS NOT NULL
+        SELECT id, invoice_id, item_code, line_amount
+        FROM invoice_lines
+        ORDER BY invoice_id ASC
     """)
     lines_raw = cursor.fetchall()
 
-    # Group lines by invoice_id
     lines_by_invoice: dict[int, list] = {}
     for line in lines_raw:
         lines_by_invoice.setdefault(line["invoice_id"], []).append(line)
 
     # --- Step 3: Clear existing earned/reversed log entries ---
-    cursor.execute("""
-        SELECT COUNT(*) AS cnt FROM points_log
-        WHERE event_type IN ('earned', 'reversed')
-    """)
+    cursor.execute(
+        "SELECT COUNT(*) AS cnt FROM points_log WHERE event_type IN ('earned', 'reversed')"
+    )
     existing_count = cursor.fetchone()["cnt"]
     log.info("Existing earned/reversed entries to clear: %d", existing_count)
 
@@ -168,24 +163,24 @@ def recalculate(dry_run: bool = False) -> None:
         cursor.execute(
             "DELETE FROM points_log WHERE event_type IN ('earned', 'reversed')"
         )
-        log.info("Cleared %d points_log entries", existing_count)
 
-    # --- Step 4: Recalculate and reinsert ---
-    new_entries   = 0
-    total_points  = 0.0
-    invoice_updates: list[tuple] = []   # (points_awarded, points_status, invoice_id)
+    # --- Step 4: Process each invoice ---
+    new_log_entries          = 0
+    total_points             = 0.0
+    invoice_updates          = []   # (eligible_amount, points_awarded, points_status, id)
+    line_updates             = []   # (earns_points, points_rate, eligible_amount, line_id)
     contractor_ids_affected: set[int] = set()
 
     for inv in invoices:
-        inv_id         = inv["id"]
-        contractor_id  = inv["contractor_id"]
-        invoice_type   = inv["invoice_type"]
-        invoice_date   = inv["invoice_date"]
-        contractor_status = contractors.get(contractor_id)
+        inv_id            = inv["id"]
+        contractor_id     = inv["contractor_id"]
+        invoice_type      = inv["invoice_type"]
+        invoice_date      = inv["invoice_date"]
+        contractor_status = contractors.get(contractor_id) if contractor_id else None
 
         lines = lines_by_invoice.get(inv_id, [])
 
-        # Calculate eligible amount and points per line using CURRENT item_master
+        # Recalculate per line using current item_master
         eligible_amount = 0.0
         inv_points      = 0.0
 
@@ -193,12 +188,25 @@ def recalculate(dry_run: bool = False) -> None:
             item_info    = item_master.get(line["item_code"])
             earns_points = item_info["earns_points"] if item_info else 0
             points_rate  = item_info["points_rate"]  if item_info else 0.0
-            if earns_points:
-                eligible_amount += abs(line["line_amount"])
-                inv_points      += calculate_points(line["line_amount"], points_rate)
+            line_eligible = abs(line["line_amount"]) if earns_points else 0.0
+            eligible_amount += line_eligible
+
+            if earns_points and contractor_id:
+                inv_points += calculate_points(line["line_amount"], points_rate)
+
+            # Queue invoice_line snapshot update
+            line_updates.append((
+                earns_points,
+                points_rate,
+                round(line_eligible, 2),
+                line["id"],
+            ))
 
         # Determine points_status
-        if contractor_status != "approved":
+        if not contractor_id:
+            points_status = "not_applicable"
+            inv_points    = 0.0
+        elif contractor_status != "approved":
             points_status = "pending"
             inv_points    = 0.0
         elif eligible_amount == 0 or inv_points == 0:
@@ -214,18 +222,25 @@ def recalculate(dry_run: bool = False) -> None:
             inv_id,
         ))
 
-        if points_status == "credited" and inv_points > 0:
-            # Calculate expires_at from invoice_date
+        # Write points_log entry
+        if points_status == "credited" and inv_points > 0 and contractor_id:
             if invoice_date:
                 expires_at = datetime.combine(invoice_date, datetime.min.time()) + timedelta(days=expiry_days)
             else:
                 expires_at = datetime.utcnow() + timedelta(days=expiry_days)
 
-            event_type = "reversed" if invoice_type == "sale_return" else "earned"
-            signed_pts = -round(inv_points, 2) if invoice_type == "sale_return" else round(inv_points, 2)
+            is_return  = invoice_type == "sale_return"
+            event_type = "reversed" if is_return else "earned"
+            signed_pts = -round(inv_points, 2) if is_return else round(inv_points, 2)
+
+            log.info(
+                "  %s %s | contractor %d | eligible ₹%.2f | points %.2f",
+                event_type.upper(), inv["bill_number"],
+                contractor_id, eligible_amount, inv_points,
+            )
 
             if not dry_run:
-                if invoice_type == "sale_return":
+                if is_return:
                     cursor.execute("""
                         INSERT INTO points_log (
                             contractor_id, invoice_id, event_type,
@@ -247,17 +262,11 @@ def recalculate(dry_run: bool = False) -> None:
                         signed_pts, round(eligible_amount, 2), expires_at,
                     ))
 
-            new_entries  += 1
-            total_points += abs(inv_points)
+            new_log_entries += 1
+            total_points    += abs(inv_points)
             contractor_ids_affected.add(contractor_id)
 
-            log.info(
-                "  %s %s | contractor %d | eligible ₹%.2f | points %.2f | %s",
-                event_type.upper(), inv["bill_number"],
-                contractor_id, eligible_amount, inv_points, points_status,
-            )
-
-    # --- Step 5: Update invoice eligible_amount, points_awarded, points_status ---
+    # --- Step 5: Update invoice records ---
     if not dry_run:
         cursor.executemany("""
             UPDATE invoices
@@ -266,7 +275,16 @@ def recalculate(dry_run: bool = False) -> None:
         """, invoice_updates)
         log.info("Updated %d invoice records", len(invoice_updates))
 
-    # --- Step 6: Recompute contractor balances ---
+    # --- Step 6: Update invoice_lines snapshots ---
+    if not dry_run:
+        cursor.executemany("""
+            UPDATE invoice_lines
+            SET earns_points = %s, points_rate = %s, eligible_amount = %s
+            WHERE id = %s
+        """, line_updates)
+        log.info("Updated %d invoice_lines snapshots", len(line_updates))
+
+    # --- Step 7: Recompute contractor balances ---
     log.info("Recomputing balances for %d contractors...", len(contractor_ids_affected))
 
     for cid in contractor_ids_affected:
@@ -317,10 +335,11 @@ def recalculate(dry_run: bool = False) -> None:
 
     log.info("-" * 60)
     log.info("Recalculation complete:")
-    log.info("  Invoices processed      : %d", len(invoices))
-    log.info("  Points log entries written : %d", new_entries)
-    log.info("  Total points awarded    : %.2f", total_points)
-    log.info("  Contractors updated     : %d", len(contractor_ids_affected))
+    log.info("  Invoices processed         : %d", len(invoices))
+    log.info("  Invoice lines refreshed    : %d", len(line_updates))
+    log.info("  Points log entries written : %d", new_log_entries)
+    log.info("  Total points               : %.2f", total_points)
+    log.info("  Contractors updated        : %d", len(contractor_ids_affected))
     if dry_run:
         log.info("  *** DRY RUN — no changes written to DB ***")
     log.info("=" * 60)
