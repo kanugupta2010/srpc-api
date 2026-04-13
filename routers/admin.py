@@ -226,3 +226,49 @@ def _fail_batch(db, batch_id: int, error_msg: str) -> None:
     """, (error_msg[:500], batch_id))
     db.commit()
     cursor.close()
+
+
+# ─── Contractors list ────────────────────────────────────────────────────────
+
+from fastapi import Query
+from typing import Optional
+from services.dependencies import require_admin
+
+
+@router.get(
+    "/contractors",
+    summary="List all contractors (admin)",
+)
+def list_contractors(
+    page:      int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    status:    Optional[str] = Query(default=None),
+    payload:   dict = Depends(require_admin),
+    db=Depends(get_db_connection),
+):
+    cursor = db.cursor(dictionary=True)
+
+    where = ["company_code = 'SRPC'"]
+    params = []
+    if status:
+        where.append("status = %s")
+        params.append(status)
+
+    where_clause = " AND ".join(where)
+    cursor.execute(f"SELECT COUNT(*) AS total FROM contractors WHERE {where_clause}", params)
+    total = cursor.fetchone()["total"]
+
+    offset = (page - 1) * page_size
+    cursor.execute(f"""
+        SELECT id, contractor_code, full_name, business_name, mobile,
+               status, tier, points_balance, total_points_earned,
+               total_points_redeemed, approved_at, last_login_at, created_at
+        FROM contractors
+        WHERE {where_clause}
+        ORDER BY created_at DESC
+        LIMIT %s OFFSET %s
+    """, params + [page_size, offset])
+    contractors = cursor.fetchall()
+    cursor.close()
+
+    return {"page": page, "page_size": page_size, "total": total, "contractors": contractors}
