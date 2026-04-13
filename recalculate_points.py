@@ -244,22 +244,22 @@ def recalculate(dry_run: bool = False) -> None:
                 if is_return:
                     cursor.execute("""
                         INSERT INTO points_log (
-                            contractor_id, invoice_id, event_type,
+                            contractor_id, invoice_id, invoice_date, event_type,
                             points, eligible_amount, notes
-                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """, (
-                        contractor_id, inv_id, event_type,
+                        contractor_id, inv_id, inv['invoice_date'], event_type,
                         signed_pts, round(eligible_amount, 2),
                         f"Recalculated — sale return: {inv['bill_number']}",
                     ))
                 else:
                     cursor.execute("""
                         INSERT INTO points_log (
-                            contractor_id, invoice_id, event_type,
+                            contractor_id, invoice_id, invoice_date, event_type,
                             points, eligible_amount, expires_at, is_expired
-                        ) VALUES (%s, %s, %s, %s, %s, %s, 0)
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, 0)
                     """, (
-                        contractor_id, inv_id, event_type,
+                        contractor_id, inv_id, inv['invoice_date'], event_type,
                         signed_pts, round(eligible_amount, 2), expires_at,
                     ))
 

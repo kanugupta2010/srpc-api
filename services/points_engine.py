@@ -180,11 +180,11 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
         if inv.invoice_type == INV_SALE_RETURN:
             cursor.execute("""
                 INSERT INTO points_log (
-                    contractor_id, invoice_id, event_type,
+                    contractor_id, invoice_id, invoice_date, event_type,
                     points, eligible_amount, notes
-                ) VALUES (%s, %s, 'reversed', %s, %s, %s)
+                ) VALUES (%s, %s, %s, 'reversed', %s, %s, %s)
             """, (
-                inv.contractor_id, invoice_id,
+                inv.contractor_id, invoice_id, inv.invoice_date,
                 -round(total_points, 2),
                 round(eligible_amount, 2),
                 f"Sale return: {inv.bill_number}",
@@ -194,11 +194,11 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
             expires_at = datetime.utcnow() + timedelta(days=expiry_days)
             cursor.execute("""
                 INSERT INTO points_log (
-                    contractor_id, invoice_id, event_type,
+                    contractor_id, invoice_id, invoice_date, event_type,
                     points, eligible_amount, expires_at, is_expired
-                ) VALUES (%s, %s, 'earned', %s, %s, %s, 0)
+                ) VALUES (%s, %s, %s, 'earned', %s, %s, %s, 0)
             """, (
-                inv.contractor_id, invoice_id,
+                inv.contractor_id, invoice_id, inv.invoice_date,
                 round(total_points, 2),
                 round(eligible_amount, 2),
                 expires_at,
