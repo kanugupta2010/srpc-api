@@ -2,7 +2,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers import auth, contractors, admin
 from routers.inventory import router as inventory_router
-app.include_router(inventory_router, prefix="/admin")
 
 app = FastAPI(
     title="SRPC Loyalty API",
@@ -22,9 +21,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth.router,        prefix="/auth",        tags=["Authentication"])
-app.include_router(contractors.router, prefix="/contractors", tags=["Contractors"])
-app.include_router(admin.router,       prefix="/admin",       tags=["Admin"])
+app.include_router(auth.router,          prefix="/auth",        tags=["Authentication"])
+app.include_router(contractors.router,   prefix="/contractors", tags=["Contractors"])
+app.include_router(admin.router,         prefix="/admin",       tags=["Admin"])
+app.include_router(inventory_router,     prefix="/admin",       tags=["Inventory"])
 
 @app.get("/health")
 def health_check():
