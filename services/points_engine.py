@@ -91,7 +91,7 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
                     points_base, counters, contractor_ids_to_update, error_notes):
 
     # Duplicate check
-    cursor.execute("SELECT id FROM invoices WHERE bill_number = %s", (inv.bill_number,))
+    cursor.execute("SELECT id FROM invoices WHERE bill_number = %s AND financial_year = %s", (inv.bill_number, inv.financial_year))
     if cursor.fetchone():
         counters["invoices_duplicate"] += 1
         counters["invoices_skipped"] += 1
@@ -143,14 +143,14 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
     # Insert invoice
     cursor.execute("""
         INSERT INTO invoices (
-            import_batch_id, invoice_date, bill_number, particulars,
+            import_batch_id, invoice_date, bill_number, financial_year, particulars,
             party_name, party_mobile, referred_by_raw,
             invoice_type, contractor_id,
             gross_amount, eligible_amount,
             points_awarded, points_status, points_credited_at
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
-        batch_id, inv.invoice_date, inv.bill_number, inv.particulars,
+        batch_id, inv.invoice_date, inv.bill_number, inv.financial_year, inv.particulars,
         inv.party_name, inv.party_mobile or None, inv.referred_by_raw or None,
         inv.invoice_type, inv.contractor_id,
         round(inv.gross_amount, 2), round(eligible_amount, 2),

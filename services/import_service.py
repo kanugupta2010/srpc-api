@@ -62,6 +62,17 @@ CUST_CONTRACTOR_REFERRED = "contractor_referred"
 CUST_WALK_IN             = "walk_in"
 
 
+def get_financial_year(d) -> str:
+    """Indian FY runs April–March. Returns e.g. '2526' for FY 2025-26."""
+    if d is None:
+        from datetime import date
+        d = date.today()
+    year, month = d.year, d.month
+    if month >= 4:
+        return f"{str(year)[2:]}{str(year+1)[2:]}"
+    return f"{str(year-1)[2:]}{str(year)[2:]}" 
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------

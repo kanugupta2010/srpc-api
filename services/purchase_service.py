@@ -120,14 +120,15 @@ def _process_single_purchase(
     tax_rates, item_tax_cats,
     company_code, counters, error_notes,
 ):
-    # Duplicate check — bill_number + supplier + date + type
+    # Duplicate check — bill_number + type + financial_year
     if inv.bill_number:
         cursor.execute("""
             SELECT id FROM purchase_invoices
             WHERE company_code = %s
               AND bill_number = %s
               AND invoice_type = %s
-        """, (company_code, inv.bill_number, inv.invoice_type))
+              AND financial_year = %s
+        """, (company_code, inv.bill_number, inv.invoice_type, inv.financial_year))
         if cursor.fetchone():
             counters["invoices_duplicate"] += 1
             counters["invoices_skipped"] += 1
@@ -162,12 +163,12 @@ def _process_single_purchase(
     cursor.execute("""
         INSERT INTO purchase_invoices (
             company_code, import_batch_id,
-            invoice_date, bill_number, supplier_name,
+            invoice_date, bill_number, financial_year, supplier_name,
             invoice_type, gross_amount_exc, gross_amount_inc
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
         company_code, batch_id,
-        inv.invoice_date, inv.bill_number, inv.supplier_name,
+        inv.invoice_date, inv.bill_number, inv.financial_year, inv.supplier_name,
         inv.invoice_type,
         round(gross_exc, 2), round(gross_inc, 2),
     ))

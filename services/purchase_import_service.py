@@ -54,6 +54,17 @@ INV_PURCHASE        = "purchase"
 INV_PURCHASE_RETURN = "purchase_return"
 
 
+def get_financial_year(d) -> str:
+    """Indian FY runs April–March. Returns e.g. '2526' for FY 2025-26."""
+    if d is None:
+        from datetime import date
+        d = date.today()
+    year, month = d.year, d.month
+    if month >= 4:
+        return f"{str(year)[2:]}{str(year+1)[2:]}"
+    return f"{str(year-1)[2:]}{str(year)[2:]}" 
+
+
 @dataclass
 class ParsedPurchaseLine:
     item_code:   str
@@ -70,6 +81,7 @@ class ParsedPurchaseInvoice:
     bill_number:   Optional[str]
     supplier_name: str
     invoice_type:  str   # purchase | purchase_return
+    financial_year: str = ""
     lines:         list = field(default_factory=list)
 
     @property
@@ -188,7 +200,8 @@ def _parse_rows(row_iter) -> tuple[list[ParsedPurchaseInvoice], dict]:
                 invoice_date  = _parse_date(date_raw),
                 bill_number   = bill_no,
                 supplier_name = particulars,
-                invoice_type  = invoice_type,
+                invoice_type   = invoice_type,
+                financial_year = get_financial_year(_parse_date(date_raw)),
             )
             invoices.append(current)
 
