@@ -14,7 +14,10 @@ app.add_middleware(
     allow_origins=[
         "https://rewards.saraswatiretail.com",
         "http://rewards.saraswatiretail.com",
+        "http://admin.saraswatiretail.com",
+        "https://admin.saraswatiretail.com",
         "http://localhost:5173",
+        "http://localhost:5174",
     ],
     allow_credentials=True,
     allow_methods=["*"],
