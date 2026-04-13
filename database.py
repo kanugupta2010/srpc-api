@@ -14,10 +14,20 @@ DB_CONFIG = {
 }
 
 connection_pool = pooling.MySQLConnectionPool(
-    pool_name="srpc_pool",
-    pool_size=10,
+    pool_name    = "srpc_pool",
+    pool_size    = 10,
+    pool_reset_session = True,
     **DB_CONFIG
 )
 
 def get_connection():
-    return connection_pool.get_connection()
+    """
+    FastAPI dependency — yields a DB connection and guarantees
+    it is returned to the pool after the request completes,
+    even if an exception is raised.
+    """
+    conn = connection_pool.get_connection()
+    try:
+        yield conn
+    finally:
+        conn.close()
