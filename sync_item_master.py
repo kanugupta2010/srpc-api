@@ -76,6 +76,7 @@ COL_BILL_LANDING        = "Bill Landing"
 COL_TAX_CATEGORY        = "Tax Category"
 COL_EARNS_POINTS        = "Earns Points"
 COL_POINTS_RATE         = "Points Rate"
+COL_REORDER_THRESHOLD   = "Reorder Threshold"
 
 # Columns ignored entirely — not stored in DB
 SKIP_COLS = {
@@ -242,6 +243,7 @@ INSERT INTO item_master (
     tax_category,
     earns_points,
     points_rate,
+    reorder_threshold,
     item_created_date,
     is_active
 ) VALUES (
@@ -260,6 +262,7 @@ INSERT INTO item_master (
     %(tax_category)s,
     %(earns_points)s,
     %(points_rate)s,
+    %(reorder_threshold)s,
     %(item_created_date)s,
     1
 )
@@ -278,6 +281,7 @@ ON DUPLICATE KEY UPDATE
     tax_category            = VALUES(tax_category),
     earns_points            = VALUES(earns_points),
     points_rate             = VALUES(points_rate),
+    reorder_threshold       = VALUES(reorder_threshold),
     item_created_date       = VALUES(item_created_date),
     is_active               = 1,
     updated_at              = CASE
@@ -288,6 +292,7 @@ ON DUPLICATE KEY UPDATE
           OR COALESCE(hsn_code,          '')        != COALESCE(VALUES(hsn_code),          '')
           OR COALESCE(sale_price_inc_gst, 0)        != COALESCE(VALUES(sale_price_inc_gst), 0)
           OR COALESCE(tax_category,      '')        != COALESCE(VALUES(tax_category),      '')
+          OR COALESCE(reorder_threshold, 0)         != COALESCE(VALUES(reorder_threshold), 0)
         THEN CURRENT_TIMESTAMP
         ELSE updated_at
     END
@@ -347,6 +352,7 @@ def sync(rows: list) -> dict:
             tax_category            = (row.get(COL_TAX_CATEGORY, "").strip() or None),
             earns_points            = earns_points,
             points_rate             = points_rate,
+            reorder_threshold       = parse_decimal(row.get(COL_REORDER_THRESHOLD, ""), COL_REORDER_THRESHOLD) or 0,
             item_created_date       = parse_date_ist(row.get(COL_DATE_OP1, "")),
         )
 
