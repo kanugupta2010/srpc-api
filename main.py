@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers import auth, contractors, admin
+from routers.inventory import router as inventory_router
+app.include_router(inventory_router, prefix="/admin")
 
 app = FastAPI(
     title="SRPC Loyalty API",
