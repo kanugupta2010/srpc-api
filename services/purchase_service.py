@@ -152,7 +152,6 @@ def _process_single_purchase(
         gross_inc += amount_inc
 
         line_data.append((
-            company_code,
             line.item_code, line.item_name,
             qty, line.unit,
             price_exc, tax_rate, price_inc,
@@ -184,7 +183,7 @@ def _process_single_purchase(
                 unit_price_exc, tax_rate, unit_price_inc,
                 line_amount_exc, line_amount_inc
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, [(purchase_invoice_id, *row) for row in line_data])
+        """, [(company_code, purchase_invoice_id, *row) for row in line_data])
 
     counters["invoices_imported"] += 1
     counters["lines_imported"]    += len(line_data)
