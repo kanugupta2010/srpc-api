@@ -141,13 +141,15 @@ def _process_single_purchase(
 
     for line in inv.lines:
         tax_cat  = item_tax_cats.get(line.item_code, "")
-        tax_rate = tax_rates.get(tax_cat, 18.0)  # default 18% if unknown
+        tax_rate = tax_rates.get(tax_cat, 18.0)
 
-        qty         = abs(float(line.quantity))
-        price_exc   = abs(float(line.unit_price_exc))
-        amount_exc  = abs(float(line.line_amount_exc))
-        price_inc   = _calc_price_inc(price_exc, tax_rate)
-        amount_inc  = round(amount_exc * (1 + tax_rate / 100), 2)
+        qty        = abs(float(line.quantity))
+        # Price and Amount in Busy 21 export are INCLUSIVE of GST
+        price_inc  = abs(float(line.unit_price_exc))   # field name is exc but value is inc
+        amount_inc = abs(float(line.line_amount_exc))   # same — stored as inc
+        # Back-calculate exc values
+        price_exc  = round(price_inc / (1 + tax_rate / 100), 4)
+        amount_exc = round(amount_inc / (1 + tax_rate / 100), 2)
 
         gross_exc += amount_exc
         gross_inc += amount_inc
