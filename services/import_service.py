@@ -97,7 +97,8 @@ class ParsedInvoice:
     party_name:      str
     party_mobile:    str
     referred_by_raw: str            # Raw Referred By value — matched as contractor_code
-    contractor_id:   Optional[int]
+    contractor_id:   Optional[int] = None
+    financial_year:  str = ""
     lines:           list = field(default_factory=list)
 
     @property
@@ -247,6 +248,7 @@ def _parse_rows(row_iter) -> tuple[list[ParsedInvoice], dict]:
                 party_mobile    = party_mobile,
                 referred_by_raw = referred_by_raw,
                 contractor_id   = None,
+                financial_year  = get_financial_year(_parse_date(row.get(COL_DATE))),
             )
             invoices.append(current)
 
