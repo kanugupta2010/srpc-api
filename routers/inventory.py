@@ -207,9 +207,12 @@ def get_stock_summary(
     params = [DEFAULT_COMPANY]
 
     if search:
-        where.append("(item_code LIKE %s OR item_name LIKE %s OR item_print_name LIKE %s)")
-        s = f"%{search}%"
-        params.extend([s, s, s])
+        # Multi-keyword search — "AP Black Enamel" matches items containing ALL words
+        keywords = [w for w in search.strip().split() if w]
+        for kw in keywords:
+            like = f"%{kw}%"
+            where.append("(item_code LIKE %s OR item_name LIKE %s OR item_print_name LIKE %s OR category LIKE %s)")
+            params.extend([like, like, like, like])
     if needs_reorder is True:
         where.append("needs_reorder = 1")
     elif needs_reorder is False:
@@ -381,3 +384,180 @@ def get_reorder_items(
     cursor.close()
 
     return {"count": len(items), "items": items}
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/inventory/ledger/{item_code} — full item ledger
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/inventory/ledger/{item_code}",
+    summary="Full chronological ledger for an item — purchases, sales, returns",
+)
+def get_item_ledger(
+    item_code: str,
+    payload:   dict = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+
+    # Item details
+    cursor.execute("""
+        SELECT item_code, item_name, item_print_name, category, unit,
+               bill_landing, reorder_threshold, earns_points, points_rate
+        FROM item_master WHERE item_code = %s AND is_active = 1
+    """, (item_code,))
+    item = cursor.fetchone()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found.")
+
+    # Purchases
+    cursor.execute("""
+        SELECT
+            pi.invoice_date    AS txn_date,
+            'purchase'         AS txn_type,
+            pi.bill_number,
+            pi.supplier_name   AS party,
+            NULL               AS party_mobile,
+            pl.quantity,
+            pl.unit,
+            pl.unit_price_inc  AS price,
+            pl.line_amount_inc AS amount,
+            pi.financial_year
+        FROM purchase_lines pl
+        JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
+        WHERE pl.item_code = %s AND pl.company_code = %s
+          AND pi.invoice_type = 'purchase'
+        ORDER BY pi.invoice_date ASC, pi.id ASC
+    """, (item_code, DEFAULT_COMPANY))
+    purchases = cursor.fetchall()
+
+    # Purchase returns
+    cursor.execute("""
+        SELECT
+            pi.invoice_date     AS txn_date,
+            'purchase_return'   AS txn_type,
+            pi.bill_number,
+            pi.supplier_name    AS party,
+            NULL                AS party_mobile,
+            pl.quantity,
+            pl.unit,
+            pl.unit_price_inc   AS price,
+            pl.line_amount_inc  AS amount,
+            pi.financial_year
+        FROM purchase_lines pl
+        JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
+        WHERE pl.item_code = %s AND pl.company_code = %s
+          AND pi.invoice_type = 'purchase_return'
+        ORDER BY pi.invoice_date ASC, pi.id ASC
+    """, (item_code, DEFAULT_COMPANY))
+    purchase_returns = cursor.fetchall()
+
+    # Sales
+    cursor.execute("""
+        SELECT
+            i.invoice_date  AS txn_date,
+            'sale'          AS txn_type,
+            i.bill_number,
+            i.party_name    AS party,
+            i.party_mobile,
+            il.quantity,
+            il.unit,
+            il.unit_price   AS price,
+            il.line_amount  AS amount,
+            i.financial_year
+        FROM invoice_lines il
+        JOIN invoices i ON i.id = il.invoice_id
+        WHERE il.item_code = %s AND i.company_code = %s
+          AND i.invoice_type = 'sale'
+        ORDER BY i.invoice_date ASC, i.id ASC
+    """, (item_code, DEFAULT_COMPANY))
+    sales = cursor.fetchall()
+
+    # Sale returns
+    cursor.execute("""
+        SELECT
+            i.invoice_date  AS txn_date,
+            'sale_return'   AS txn_type,
+            i.bill_number,
+            i.party_name    AS party,
+            i.party_mobile,
+            il.quantity,
+            il.unit,
+            il.unit_price   AS price,
+            il.line_amount  AS amount,
+            i.financial_year
+        FROM invoice_lines il
+        JOIN invoices i ON i.id = il.invoice_id
+        WHERE il.item_code = %s AND i.company_code = %s
+          AND i.invoice_type = 'sale_return'
+        ORDER BY i.invoice_date ASC, i.id ASC
+    """, (item_code, DEFAULT_COMPANY))
+    sale_returns = cursor.fetchall()
+
+    cursor.close()
+
+    # Merge and sort all transactions chronologically
+    all_txns = purchases + purchase_returns + sales + sale_returns
+    all_txns.sort(key=lambda x: (x["txn_date"] or "0000-00-00", x["txn_type"]))
+
+    # Calculate running stock
+    running_stock = 0.0
+    for txn in all_txns:
+        qty = float(txn["quantity"] or 0)
+        if txn["txn_type"] == "purchase":
+            running_stock += qty
+        elif txn["txn_type"] == "purchase_return":
+            running_stock -= abs(qty)
+        elif txn["txn_type"] == "sale":
+            running_stock -= abs(qty)
+        elif txn["txn_type"] == "sale_return":
+            running_stock += abs(qty)
+        txn["running_stock"] = round(running_stock, 4)
+
+    return {
+        "item":         item,
+        "transactions": all_txns,
+        "summary": {
+            "total_purchased":       sum(float(t["quantity"] or 0) for t in purchases),
+            "total_purchase_returned": sum(abs(float(t["quantity"] or 0)) for t in purchase_returns),
+            "total_sold":            sum(abs(float(t["quantity"] or 0)) for t in sales),
+            "total_sale_returned":   sum(abs(float(t["quantity"] or 0)) for t in sale_returns),
+            "current_stock":         round(running_stock, 4),
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# PUT /admin/inventory/bill-landing/{item_code} — update bill landing price
+# ---------------------------------------------------------------------------
+
+class BillLandingRequest(BaseModel):
+    bill_landing: Optional[float]
+
+
+@router.put(
+    "/inventory/bill-landing/{item_code}",
+    summary="Update bill landing price for an item",
+)
+def update_bill_landing(
+    item_code: str,
+    req:       BillLandingRequest,
+    payload:   dict = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT item_code FROM item_master WHERE item_code = %s AND is_active = 1",
+        (item_code,)
+    )
+    if not cursor.fetchone():
+        raise HTTPException(status_code=404, detail="Item not found.")
+
+    cursor.execute(
+        "UPDATE item_master SET bill_landing = %s WHERE item_code = %s",
+        (req.bill_landing, item_code)
+    )
+    db.commit()
+    cursor.close()
+    return {"message": f"Bill landing updated for {item_code}", "bill_landing": req.bill_landing}

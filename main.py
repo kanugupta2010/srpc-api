@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers import auth, contractors, admin
 from routers.inventory import router as inventory_router
+from routers.sync import router as sync_router
 
 app = FastAPI(
     title="SRPC Loyalty API",
@@ -14,7 +15,6 @@ app.add_middleware(
     allow_origins=[
         "https://rewards.saraswatiretail.com",
         "http://rewards.saraswatiretail.com",
-        "http://admin.saraswatiretail.com",
         "https://admin.saraswatiretail.com",
         "http://localhost:5173",
         "http://localhost:5174",
@@ -24,15 +24,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth.router,          prefix="/auth",        tags=["Authentication"])
-app.include_router(contractors.router,   prefix="/contractors", tags=["Contractors"])
-app.include_router(admin.router,         prefix="/admin",       tags=["Admin"])
-app.include_router(inventory_router,     prefix="/admin",       tags=["Inventory"])
+app.include_router(auth.router,        prefix="/auth",        tags=["Authentication"])
+app.include_router(contractors.router, prefix="/contractors", tags=["Contractors"])
+app.include_router(admin.router,       prefix="/admin",       tags=["Admin"])
+app.include_router(inventory_router,   prefix="/admin",       tags=["Inventory"])
+app.include_router(sync_router,        prefix="/admin",       tags=["Sync"])
 
 @app.get("/health")
 def health_check():
     return {
-        "status": "ok",
-        "app": "SRPC Loyalty API",
+        "status":  "ok",
+        "app":     "SRPC Loyalty API",
         "version": "1.0.0"
     }

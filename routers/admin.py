@@ -182,10 +182,13 @@ def list_imports(
 
 @router.get(
     "/imports/{batch_id}",
-    response_model=ImportSummaryResponse,
     summary="Get single import batch detail",
 )
-def get_import(batch_id: int, db = Depends(get_db_connection)):
+def get_import(
+    batch_id: int,
+    payload:  dict = Depends(require_admin),
+    db=Depends(get_db_connection),
+):
     batch = _fetch_batch(db, batch_id)
     if not batch:
         raise HTTPException(status_code=404, detail="Import batch not found.")

@@ -28,6 +28,16 @@ def _load_tax_rates(cursor, company_code: str) -> dict:
     return {r["tax_category"]: float(r["tax_rate"]) for r in cursor.fetchall()}
 
 
+def _is_gst_applicable(cursor, company_code: str) -> bool:
+    """Returns True if GST should be applied for this company."""
+    cursor.execute(
+        "SELECT gst_applicable FROM companies WHERE company_code = %s",
+        (company_code,)
+    )
+    row = cursor.fetchone()
+    return bool(row["gst_applicable"]) if row else True
+
+
 def _load_item_tax_categories(cursor, item_codes: list) -> dict:
     """Returns dict: item_code → tax_category"""
     if not item_codes:
@@ -52,8 +62,9 @@ def process_purchase_invoices(
 ) -> dict:
     cursor = db_conn.cursor(dictionary=True)
 
-    # Load tax rates once
-    tax_rates     = _load_tax_rates(cursor, company_code)
+    # Load company settings
+    gst_applicable = _is_gst_applicable(cursor, company_code)
+    tax_rates      = _load_tax_rates(cursor, company_code)
 
     # Collect all item codes for bulk tax category lookup
     all_item_codes = list({
@@ -79,7 +90,7 @@ def process_purchase_invoices(
             _process_single_purchase(
                 inv, batch_id, cursor,
                 tax_rates, item_tax_cats,
-                company_code, counters, error_notes,
+                company_code, gst_applicable, counters, error_notes,
             )
             if inv.invoice_date:
                 dates.append(inv.invoice_date)
@@ -118,7 +129,7 @@ def process_purchase_invoices(
 def _process_single_purchase(
     inv, batch_id, cursor,
     tax_rates, item_tax_cats,
-    company_code, counters, error_notes,
+    company_code, gst_applicable, counters, error_notes,
 ):
     # Duplicate check — bill_number + type + financial_year
     if inv.bill_number:
@@ -144,12 +155,23 @@ def _process_single_purchase(
         tax_rate = tax_rates.get(tax_cat, 18.0)
 
         qty        = abs(float(line.quantity))
-        # Price and Amount in Busy 21 export are INCLUSIVE of GST
-        price_inc  = abs(float(line.unit_price_exc))   # field name is exc but value is inc
-        amount_inc = abs(float(line.line_amount_exc))   # same — stored as inc
-        # Back-calculate exc values
-        price_exc  = round(price_inc / (1 + tax_rate / 100), 4)
-        amount_exc = round(amount_inc / (1 + tax_rate / 100), 2)
+        # Prices from Busy 21 are stored as-is
+        price_raw  = abs(float(line.unit_price_exc))
+        amount_raw = abs(float(line.line_amount_exc))
+
+        if gst_applicable:
+            # Prices are inc GST — back-calculate exc
+            price_inc  = price_raw
+            amount_inc = amount_raw
+            price_exc  = round(price_raw / (1 + tax_rate / 100), 4)
+            amount_exc = round(amount_raw / (1 + tax_rate / 100), 2)
+        else:
+            # GST not applicable — store as-is, no calculation
+            price_inc  = price_raw
+            amount_inc = amount_raw
+            price_exc  = price_raw
+            amount_exc = amount_raw
+            tax_rate   = 0.0
 
         gross_exc += amount_exc
         gross_inc += amount_inc
