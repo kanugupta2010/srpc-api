@@ -242,8 +242,12 @@ def get_stock_summary(
         "reorder_threshold", "needs_reorder", "latest_purchase_date",
     }
     # Smart sort options
-    if sort_col == "smart_recent":
+    if sort_col == "smart_activity":
+        order_clause = "GREATEST(COALESCE(latest_purchase_date,'1970-01-01'), COALESCE(latest_sale_date,'1970-01-01')) DESC, item_name ASC"
+    elif sort_col == "smart_purchased":
         order_clause = "latest_purchase_date DESC, item_name ASC"
+    elif sort_col == "smart_sold_date":
+        order_clause = "latest_sale_date DESC, item_name ASC"
     elif sort_col == "smart_sold":
         order_clause = "qty_sold DESC, item_name ASC"
     elif sort_col in SORTABLE:
@@ -261,6 +265,7 @@ def get_stock_summary(
             latest_purchase_price_exc,
             latest_purchase_price_inc,
             latest_purchase_date,
+            latest_sale_date,
             bill_landing,
             reorder_threshold,
             needs_reorder
