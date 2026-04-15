@@ -147,16 +147,31 @@ async def import_csv(
 
 @router.get(
     "/imports",
-    response_model=List[ImportListResponse],
     summary="List all import batches",
 )
-def list_imports(db = Depends(get_db_connection)):
+def list_imports(
+    page:      int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    payload:   dict = Depends(require_admin),
+    db=Depends(get_db_connection),
+):
     """Returns import history, most recent first."""
     cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM vw_import_summary LIMIT 100")
-    rows = cursor.fetchall()
+    cursor.execute("SELECT COUNT(*) AS total FROM import_batches")
+    total = cursor.fetchone()["total"]
+    offset = (page - 1) * page_size
+    cursor.execute("""
+        SELECT id, filename, imported_by, status,
+               total_rows, invoices_found, invoices_imported,
+               invoices_skipped, points_awarded,
+               date_from, date_to, notes, created_at
+        FROM import_batches
+        ORDER BY created_at DESC
+        LIMIT %s OFFSET %s
+    """, (page_size, offset))
+    batches = cursor.fetchall()
     cursor.close()
-    return rows
+    return {"page": page, "page_size": page_size, "total": total, "batches": batches}
 
 
 # ---------------------------------------------------------------------------
