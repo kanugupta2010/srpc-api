@@ -196,6 +196,8 @@ def get_stock_summary(
     search:       Optional[str]  = Query(default=None, description="Search item name or code"),
     needs_reorder: Optional[bool] = Query(default=None, description="Filter items needing reorder"),
     category:     Optional[str]  = Query(default=None, description="Filter by category"),
+    sort_col:     Optional[str]  = Query(default="needs_reorder", description="Column to sort by"),
+    sort_dir:     Optional[str]  = Query(default="desc", description="asc or desc"),
     page:         int = Query(default=1, ge=1),
     page_size:    int = Query(default=50, ge=1, le=500),
     payload:      dict = Depends(require_admin),
@@ -232,6 +234,24 @@ def get_stock_summary(
 
     # Paginated results
     offset = (page - 1) * page_size
+    # Safe column whitelist — prevents SQL injection
+    SORTABLE = {
+        "item_code", "item_name", "category", "unit",
+        "current_stock", "qty_sold", "qty_purchased",
+        "latest_purchase_price_inc", "bill_landing",
+        "reorder_threshold", "needs_reorder", "latest_purchase_date",
+    }
+    # Smart sort options
+    if sort_col == "smart_recent":
+        order_clause = "latest_purchase_date DESC, item_name ASC"
+    elif sort_col == "smart_sold":
+        order_clause = "qty_sold DESC, item_name ASC"
+    elif sort_col in SORTABLE:
+        direction = "DESC" if sort_dir == "desc" else "ASC"
+        order_clause = f"{sort_col} {direction}, item_name ASC"
+    else:
+        order_clause = "needs_reorder DESC, item_name ASC"
+
     cursor.execute(f"""
         SELECT
             item_code, item_name, item_print_name, category, unit,
@@ -246,7 +266,7 @@ def get_stock_summary(
             needs_reorder
         FROM vw_stock_summary
         WHERE {where_clause}
-        ORDER BY needs_reorder DESC, item_name ASC
+        ORDER BY {order_clause}
         LIMIT %s OFFSET %s
     """, params + [page_size, offset])
     items = cursor.fetchall()
