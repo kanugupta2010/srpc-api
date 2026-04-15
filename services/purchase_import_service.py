@@ -136,17 +136,28 @@ def _get_qty(row: dict) -> float:
 def _iter_rows_xlsx(content: bytes):
     wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
     ws = wb.active
-    rows = ws.iter_rows(values_only=True)
-    header_row = next(rows, None)
-    if header_row is None:
-        raise ValueError("XLSX file is empty.")
-    headers = [_to_str(h) for h in header_row]
+    all_rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    # Find the header row — it contains 'Date' and 'Vch Type'
+    # Busy 21 exports may have 1-3 title rows before the actual header
+    header_idx = None
+    for i, row in enumerate(all_rows):
+        row_vals = [_to_str(v) for v in row]
+        if "Date" in row_vals and "Vch Type" in row_vals:
+            header_idx = i
+            break
+
+    if header_idx is None:
+        raise ValueError("Could not find header row with 'Date' and 'Vch Type' columns.")
+
+    headers = [_to_str(h) for h in all_rows[header_idx]]
     missing = REQUIRED_COLS - set(headers)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}. Found: {headers}")
-    for row in rows:
+
+    for row in all_rows[header_idx + 1:]:
         yield dict(zip(headers, row))
-    wb.close()
 
 
 def _iter_rows_csv(content: bytes):
