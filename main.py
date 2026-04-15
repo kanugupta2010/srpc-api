@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from routers import auth, contractors, admin
 from routers.inventory import router as inventory_router
 from routers.sync import router as sync_router
+from routers.reports import router as reports_router
 
 app = FastAPI(
     title="SRPC Loyalty API",
@@ -29,6 +30,7 @@ app.include_router(contractors.router, prefix="/contractors", tags=["Contractors
 app.include_router(admin.router,       prefix="/admin",       tags=["Admin"])
 app.include_router(inventory_router,   prefix="/admin",       tags=["Inventory"])
 app.include_router(sync_router,        prefix="/admin",       tags=["Sync"])
+app.include_router(reports_router,     prefix="/admin",       tags=["Reports"])
 
 @app.get("/health")
 def health_check():

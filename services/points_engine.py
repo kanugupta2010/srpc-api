@@ -91,7 +91,18 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
                     points_base, counters, contractor_ids_to_update, error_notes):
 
     # Duplicate check
-    cursor.execute("SELECT id FROM invoices WHERE bill_number = %s AND financial_year = %s", (inv.bill_number, inv.financial_year))
+    # With bill_number: match on bill_number + financial_year
+    # Without bill_number: match on invoice_date + particulars + invoice_type
+    if inv.bill_number:
+        cursor.execute(
+            "SELECT id FROM invoices WHERE bill_number = %s AND financial_year = %s",
+            (inv.bill_number, inv.financial_year)
+        )
+    else:
+        cursor.execute(
+            "SELECT id FROM invoices WHERE bill_number IS NULL AND invoice_date = %s AND particulars = %s AND invoice_type = %s",
+            (inv.invoice_date, inv.particulars, inv.invoice_type)
+        )
     if cursor.fetchone():
         counters["invoices_duplicate"] += 1
         counters["invoices_skipped"] += 1

@@ -131,7 +131,9 @@ def _process_single_purchase(
     tax_rates, item_tax_cats,
     company_code, gst_applicable, counters, error_notes,
 ):
-    # Duplicate check — bill_number + type + financial_year
+    # Duplicate check
+    # With bill_number: match on bill_number + invoice_type + financial_year
+    # Without bill_number: match on invoice_date + supplier_name + invoice_type
     if inv.bill_number:
         cursor.execute("""
             SELECT id FROM purchase_invoices
@@ -140,10 +142,19 @@ def _process_single_purchase(
               AND invoice_type = %s
               AND financial_year = %s
         """, (company_code, inv.bill_number, inv.invoice_type, inv.financial_year))
-        if cursor.fetchone():
-            counters["invoices_duplicate"] += 1
-            counters["invoices_skipped"] += 1
-            return
+    else:
+        cursor.execute("""
+            SELECT id FROM purchase_invoices
+            WHERE company_code = %s
+              AND bill_number IS NULL
+              AND invoice_date = %s
+              AND supplier_name = %s
+              AND invoice_type = %s
+        """, (company_code, inv.invoice_date, inv.supplier_name, inv.invoice_type))
+    if cursor.fetchone():
+        counters["invoices_duplicate"] += 1
+        counters["invoices_skipped"] += 1
+        return
 
     # Calculate totals with tax
     line_data         = []
