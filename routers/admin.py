@@ -10,14 +10,15 @@ Admin endpoints:
 
 import logging
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 
 from database import get_connection as get_db_connection
 from models.schemas import ImportListResponse, ImportSummaryResponse
 from services.import_service import parse_file, resolve_contractors
 from services.points_engine import process_invoices
+from services.dependencies import require_admin
 
 log = logging.getLogger(__name__)
 
@@ -34,8 +35,9 @@ router = APIRouter(tags=["Admin"])
     status_code=status.HTTP_201_CREATED,
 )
 async def import_csv(
-    file: UploadFile = File(...),
-    db   = Depends(get_db_connection),
+    file:    UploadFile = File(...),
+    payload: dict = Depends(require_admin),
+    db=Depends(get_db_connection),
 ):
     """
     Upload a CSV exported from Busy 21.
@@ -244,10 +246,6 @@ def _fail_batch(db, batch_id: int, error_msg: str) -> None:
 
 
 # ─── Contractors list ────────────────────────────────────────────────────────
-
-from fastapi import Query
-from typing import Optional
-from services.dependencies import require_admin
 
 
 @router.get(
