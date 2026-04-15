@@ -241,6 +241,7 @@ def get_stock_summary(
             latest_purchase_price_exc,
             latest_purchase_price_inc,
             latest_purchase_date,
+            bill_landing,
             reorder_threshold,
             needs_reorder
         FROM vw_stock_summary
