@@ -77,6 +77,8 @@ COL_TAX_CATEGORY        = "Tax Category"
 COL_EARNS_POINTS        = "Earns Points"
 COL_POINTS_RATE         = "Points Rate"
 COL_REORDER_THRESHOLD   = "Reorder Threshold"
+COL_ACTUAL_QUANTITY     = "Actual Quantity"
+COL_TAGS                = "Tags"
 
 # Columns ignored entirely — not stored in DB
 SKIP_COLS = {
@@ -244,6 +246,8 @@ INSERT INTO item_master (
     earns_points,
     points_rate,
     reorder_threshold,
+    actual_quantity,
+    tags_raw,
     item_created_date,
     is_active
 ) VALUES (
@@ -263,6 +267,8 @@ INSERT INTO item_master (
     %(earns_points)s,
     %(points_rate)s,
     %(reorder_threshold)s,
+    %(actual_quantity)s,
+    %(tags_raw)s,
     %(item_created_date)s,
     1
 )
@@ -282,6 +288,8 @@ ON DUPLICATE KEY UPDATE
     earns_points            = VALUES(earns_points),
     points_rate             = VALUES(points_rate),
     reorder_threshold       = VALUES(reorder_threshold),
+    actual_quantity         = VALUES(actual_quantity),
+    tags_raw                = VALUES(tags_raw),
     item_created_date       = VALUES(item_created_date),
     is_active               = 1,
     updated_at              = CASE
@@ -293,6 +301,8 @@ ON DUPLICATE KEY UPDATE
           OR COALESCE(sale_price_inc_gst, 0)        != COALESCE(VALUES(sale_price_inc_gst), 0)
           OR COALESCE(tax_category,      '')        != COALESCE(VALUES(tax_category),      '')
           OR COALESCE(reorder_threshold, 0)         != COALESCE(VALUES(reorder_threshold), 0)
+          OR COALESCE(actual_quantity,    '')        != COALESCE(VALUES(actual_quantity),    '')
+          OR COALESCE(tags_raw,           '')        != COALESCE(VALUES(tags_raw),           '')
         THEN CURRENT_TIMESTAMP
         ELSE updated_at
     END
@@ -353,6 +363,8 @@ def sync(rows: list) -> dict:
             earns_points            = earns_points,
             points_rate             = points_rate,
             reorder_threshold       = parse_decimal(row.get(COL_REORDER_THRESHOLD, ""), COL_REORDER_THRESHOLD) or 0,
+            actual_quantity         = row.get(COL_ACTUAL_QUANTITY, "").strip() or None,
+            tags_raw                = row.get(COL_TAGS, "").strip() or None,
             item_created_date       = parse_date_ist(row.get(COL_DATE_OP1, "")),
         )
 
@@ -383,6 +395,77 @@ def sync(rows: list) -> dict:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def sync_tags(rows: list, company_code: str = "SRPC") -> dict:
+    """
+    Parse Tags column from sheet rows and sync to item_tags + item_tag_map.
+    For each item:
+      1. Parse comma-separated tags
+      2. Upsert each unique tag into item_tags
+      3. Delete existing mappings for this item
+      4. Re-insert fresh mappings
+    """
+    conn   = get_db_connection()
+    cursor = conn.cursor()
+
+    counters = dict(tags_created=0, tags_reused=0, mappings_updated=0)
+
+    # Build: item_code → [tag1, tag2, ...]
+    all_tags: set = set()
+    item_tags_map: dict = {}
+
+    for row in rows:
+        item_code = row.get(COL_ALIAS, "").strip()
+        tags_raw  = row.get(COL_TAGS, "").strip()
+        if not item_code:
+            continue
+        tags = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else []
+        item_tags_map[item_code] = tags
+        all_tags.update(tags)
+
+    # Upsert all unique tag names — get or create id
+    tag_id_map: dict = {}
+    for tag_name in all_tags:
+        cursor.execute(
+            "SELECT id FROM item_tags WHERE company_code = %s AND tag_name = %s",
+            (company_code, tag_name)
+        )
+        existing = cursor.fetchone()
+        if existing:
+            tag_id_map[tag_name] = existing[0]
+            counters["tags_reused"] += 1
+        else:
+            cursor.execute(
+                "INSERT INTO item_tags (company_code, tag_name) VALUES (%s, %s)",
+                (company_code, tag_name)
+            )
+            tag_id_map[tag_name] = cursor.lastrowid
+            counters["tags_created"] += 1
+
+    # Sync item_tag_map for each item
+    for item_code, tags in item_tags_map.items():
+        # Always wipe and re-insert to keep in sync with sheet
+        cursor.execute(
+            "DELETE FROM item_tag_map WHERE company_code = %s AND item_code = %s",
+            (company_code, item_code)
+        )
+        if tags:
+            rows_to_insert = [
+                (company_code, item_code, tag_id_map[t])
+                for t in tags if t in tag_id_map
+            ]
+            if rows_to_insert:
+                cursor.executemany(
+                    "INSERT IGNORE INTO item_tag_map (company_code, item_code, tag_id) VALUES (%s, %s, %s)",
+                    rows_to_insert
+                )
+                counters["mappings_updated"] += 1
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return counters
+
+
 def validate_env():
     missing = [k for k in ("SHEET_ID", "DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
                if not os.getenv(k)]
@@ -404,24 +487,29 @@ def main():
         log.warning("Sheet returned 0 rows — nothing to sync.")
         sys.exit(0)
 
+    # Sync item_master fields
     result = sync(rows)
 
     log.info("-" * 60)
-    log.info("Sync complete:")
+    log.info("Item Master Sync:")
     log.info("  Inserted  : %d", result["inserted"])
     log.info("  Updated   : %d", result["updated"])
     log.info("  Unchanged : %d", result["unchanged"])
-    log.info("  Skipped   : %d  (blank / incomplete rows)", result["skipped"])
+    log.info("  Skipped   : %d", result["skipped"])
     log.info("  Errors    : %d", result["errors"])
 
+    # Sync tags
+    tag_result = sync_tags(rows)
+    log.info("-" * 60)
+    log.info("Tag Sync:")
+    log.info("  Tags created  : %d", tag_result["tags_created"])
+    log.info("  Tags reused   : %d", tag_result["tags_reused"])
+    log.info("  Items updated : %d", tag_result["mappings_updated"])
+
     if result["error_details"]:
-        log.warning("Error details:")
+        log.warning("Errors:")
         for detail in result["error_details"]:
             log.warning("  %s", detail)
 
     log.info("=" * 60)
     sys.exit(1 if result["errors"] else 0)
-
-
-if __name__ == "__main__":
-    main()
