@@ -46,6 +46,8 @@ COL_EARNS_POINTS        = "Earns Points"
 COL_POINTS_RATE         = "Points Rate"
 COL_REORDER_THRESHOLD   = "Reorder Threshold"
 COL_DATE_OP1            = "Date - Op 1"
+COL_ACTUAL_QUANTITY     = "Actual Quantity"
+COL_TAGS                = "Tags"
 
 
 def _fetch_sheet_rows() -> list[dict]:
@@ -101,9 +103,10 @@ def _upsert_item(cursor, row: dict) -> str:
             purchase_price_exc_gst, purchase_price_inc_gst,
             sale_price_exc_gst, sale_price_inc_gst,
             kacha_sale_price, bill_landing, tax_category,
-            earns_points, points_rate, reorder_threshold, is_active
+            earns_points, points_rate, reorder_threshold,
+            actual_quantity, tags_raw, is_active
         ) VALUES (
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1
+            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1
         )
         ON DUPLICATE KEY UPDATE
             item_name               = VALUES(item_name),
@@ -121,6 +124,8 @@ def _upsert_item(cursor, row: dict) -> str:
             earns_points            = VALUES(earns_points),
             points_rate             = VALUES(points_rate),
             reorder_threshold       = VALUES(reorder_threshold),
+            actual_quantity         = VALUES(actual_quantity),
+            tags_raw                = VALUES(tags_raw),
             is_active               = 1,
             updated_at              = CURRENT_TIMESTAMP
     """, (
@@ -140,12 +145,70 @@ def _upsert_item(cursor, row: dict) -> str:
         earns_points,
         points_rate,
         _parse_decimal(row.get(COL_REORDER_THRESHOLD, "")) or 0,
+        row.get(COL_ACTUAL_QUANTITY, "").strip() or None,
+        row.get(COL_TAGS, "").strip() or None,
     ))
 
     rc = cursor.rowcount
     if rc == 1:   return "inserted"
     if rc == 2:   return "updated"
     return "unchanged"
+
+
+
+def _sync_tags(rows: list, cursor, db, company_code: str = "SRPC") -> dict:
+    """Sync tags from sheet rows into item_tags and item_tag_map."""
+    counters = dict(tags_created=0, tags_reused=0, mappings_updated=0)
+
+    # Build item_code → [tags] map and collect all unique tags
+    all_tags: set = set()
+    item_tags_map: dict = {}
+
+    for row in rows:
+        item_code = row.get(COL_ALIAS, "").strip()
+        tags_raw  = row.get(COL_TAGS, "").strip()
+        if not item_code:
+            continue
+        tags = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else []
+        item_tags_map[item_code] = tags
+        all_tags.update(tags)
+
+    # Get or create each tag
+    tag_id_map: dict = {}
+    for tag_name in all_tags:
+        cursor.execute(
+            "SELECT id FROM item_tags WHERE company_code = %s AND tag_name = %s",
+            (company_code, tag_name)
+        )
+        existing = cursor.fetchone()
+        if existing:
+            tag_id_map[tag_name] = existing["id"]
+            counters["tags_reused"] += 1
+        else:
+            cursor.execute(
+                "INSERT INTO item_tags (company_code, tag_name) VALUES (%s, %s)",
+                (company_code, tag_name)
+            )
+            tag_id_map[tag_name] = cursor.lastrowid
+            counters["tags_created"] += 1
+
+    # Sync item_tag_map — wipe and re-insert per item
+    for item_code, tags in item_tags_map.items():
+        cursor.execute(
+            "DELETE FROM item_tag_map WHERE company_code = %s AND item_code = %s",
+            (company_code, item_code)
+        )
+        if tags:
+            to_insert = [(company_code, item_code, tag_id_map[t]) for t in tags if t in tag_id_map]
+            if to_insert:
+                cursor.executemany(
+                    "INSERT IGNORE INTO item_tag_map (company_code, item_code, tag_id) VALUES (%s, %s, %s)",
+                    to_insert
+                )
+                counters["mappings_updated"] += 1
+
+    db.commit()
+    return counters
 
 
 # ---------------------------------------------------------------------------
@@ -175,13 +238,19 @@ def sync_item_master(
             errors.append(f"{row.get(COL_ALIAS, '?')}: {exc}")
 
     db.commit()
+
+    # Sync tags
+    tag_counters = _sync_tags(rows, cursor, db)
     cursor.close()
 
     return {
-        "synced_at":  datetime.utcnow().isoformat(),
-        "total_rows": len(rows),
+        "synced_at":   datetime.utcnow().isoformat(),
+        "total_rows":  len(rows),
         **counters,
-        "errors":     errors[:10] if errors else None,
+        "tags_created":    tag_counters["tags_created"],
+        "tags_reused":     tag_counters["tags_reused"],
+        "items_tagged":    tag_counters["mappings_updated"],
+        "errors":      errors[:10] if errors else None,
     }
 
 
