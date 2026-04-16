@@ -570,3 +570,370 @@ def list_suppliers(
     suppliers = cursor.fetchall()
     cursor.close()
     return {"suppliers": suppliers}
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/reports/sales/vouchers — voucher-wise sales report
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/sales/vouchers", summary="Voucher-wise sales report")
+def sales_vouchers_report(
+    period:        str           = Query(default="this_month"),
+    date_from:     Optional[str] = Query(default=None),
+    date_to:       Optional[str] = Query(default=None),
+    party_names:   Optional[str] = Query(default=None),
+    voucher_types: Optional[str] = Query(default=None),
+    payload:       dict          = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    from_dt, to_dt = get_date_range(period, date_from, date_to)
+    cursor = db.cursor(dictionary=True)
+
+    where = "i.company_code = %s AND i.invoice_date BETWEEN %s AND %s"
+    params = [DEFAULT_COMPANY, from_dt, to_dt]
+
+    if party_names:
+        names = [n.strip() for n in party_names.split("|||") if n.strip()]
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            where += f" AND i.party_name IN ({ph})"
+            params += names
+
+    if voucher_types:
+        types = [t.strip() for t in voucher_types.split(",") if t.strip()]
+        if types:
+            ph = ",".join(["%s"] * len(types))
+            where += f" AND i.invoice_type IN ({ph})"
+            params += types
+
+    cursor.execute(f"""
+        SELECT
+            i.id,
+            i.invoice_date,
+            i.bill_number,
+            i.invoice_type,
+            i.customer_type,
+            i.party_name,
+            i.party_mobile,
+            i.gross_amount,
+            i.eligible_amount,
+            i.points_awarded,
+            i.points_status,
+            i.financial_year,
+            COUNT(il.id)  AS line_count,
+            SUM(ABS(il.quantity)) AS total_qty
+        FROM invoices i
+        LEFT JOIN invoice_lines il ON il.invoice_id = i.id
+        WHERE {where}
+        GROUP BY i.id
+        ORDER BY i.invoice_date DESC, i.id DESC
+    """, params)
+    vouchers = cursor.fetchall()
+
+    cursor.execute(f"""
+        SELECT
+            COUNT(DISTINCT i.id)  AS invoice_count,
+            SUM(i.gross_amount)   AS total_amount,
+            SUM(i.points_awarded) AS total_points
+        FROM invoices i WHERE {where}
+    """, params)
+    summary = cursor.fetchone()
+    cursor.close()
+
+    return {
+        "period": period, "date_from": str(from_dt), "date_to": str(to_dt),
+        "summary": summary, "vouchers": vouchers,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/reports/sales/vouchers/{invoice_id}/lines — voucher line items
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/sales/vouchers/{invoice_id}/lines", summary="Line items for a sales voucher")
+def sales_voucher_lines(
+    invoice_id: int,
+    payload:    dict = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT * FROM invoices WHERE id = %s AND company_code = %s",
+        (invoice_id, DEFAULT_COMPANY)
+    )
+    invoice = cursor.fetchone()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+
+    cursor.execute("""
+        SELECT item_code, item_name, quantity, unit, unit_price, line_amount
+        FROM invoice_lines WHERE invoice_id = %s ORDER BY id ASC
+    """, (invoice_id,))
+    lines = cursor.fetchall()
+    cursor.close()
+    return {"invoice": invoice, "lines": lines}
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/reports/sales/items — item-wise sales report
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/sales/items", summary="Item-wise sales report grouped by item")
+def sales_items_report(
+    period:        str           = Query(default="this_month"),
+    date_from:     Optional[str] = Query(default=None),
+    date_to:       Optional[str] = Query(default=None),
+    tag_ids:       Optional[str] = Query(default=None),
+    party_names:   Optional[str] = Query(default=None),
+    voucher_types: Optional[str] = Query(default=None),
+    payload:       dict          = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    from_dt, to_dt = get_date_range(period, date_from, date_to)
+    cursor = db.cursor(dictionary=True)
+
+    where = "i.company_code = %s AND i.invoice_date BETWEEN %s AND %s"
+    params = [DEFAULT_COMPANY, from_dt, to_dt]
+
+    if tag_ids:
+        ids = [x.strip() for x in tag_ids.split(",") if x.strip().isdigit()]
+        if ids:
+            ph = ",".join(["%s"] * len(ids))
+            where += f" AND il.item_code IN (SELECT item_code FROM item_tag_map WHERE tag_id IN ({ph}) AND company_code = %s)"
+            params += ids + [DEFAULT_COMPANY]
+
+    if party_names:
+        names = [n.strip() for n in party_names.split("|||") if n.strip()]
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            where += f" AND i.party_name IN ({ph})"
+            params += names
+
+    if voucher_types:
+        types = [t.strip() for t in voucher_types.split(",") if t.strip()]
+        if types:
+            ph = ",".join(["%s"] * len(types))
+            where += f" AND i.invoice_type IN ({ph})"
+            params += types
+
+    cursor.execute(f"""
+        SELECT
+            il.item_code,
+            il.item_name,
+            im.category,
+            im.unit,
+            im.actual_quantity,
+            im.bill_landing,
+            COUNT(DISTINCT i.id)          AS voucher_count,
+            SUM(ABS(il.quantity))         AS total_qty,
+            SUM(ABS(il.line_amount))      AS total_amount,
+            AVG(ABS(il.unit_price))       AS avg_price,
+            MAX(i.invoice_date)           AS last_sold
+        FROM invoice_lines il
+        JOIN invoices i ON i.id = il.invoice_id
+        LEFT JOIN item_master im ON im.item_code = il.item_code AND im.company_code = i.company_code
+        WHERE {where}
+        GROUP BY il.item_code, il.item_name, im.category, im.unit, im.actual_quantity, im.bill_landing
+        ORDER BY total_amount DESC
+    """, params)
+    items = cursor.fetchall()
+
+    cursor.execute(f"""
+        SELECT
+            COUNT(DISTINCT il.item_code) AS item_count,
+            SUM(ABS(il.line_amount))     AS total_amount,
+            SUM(ABS(il.quantity))        AS total_qty
+        FROM invoice_lines il
+        JOIN invoices i ON i.id = il.invoice_id
+        WHERE {where}
+    """, params)
+    summary = cursor.fetchone()
+    cursor.close()
+
+    return {
+        "period": period, "date_from": str(from_dt), "date_to": str(to_dt),
+        "summary": summary, "items": items,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/reports/purchases/vouchers — voucher-wise purchase report
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/purchases/vouchers", summary="Voucher-wise purchase report")
+def purchases_vouchers_report(
+    period:          str           = Query(default="this_month"),
+    date_from:       Optional[str] = Query(default=None),
+    date_to:         Optional[str] = Query(default=None),
+    supplier_names:  Optional[str] = Query(default=None),
+    voucher_types:   Optional[str] = Query(default=None),
+    payload:         dict          = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    from_dt, to_dt = get_date_range(period, date_from, date_to)
+    cursor = db.cursor(dictionary=True)
+
+    where = "pi.company_code = %s AND pi.invoice_date BETWEEN %s AND %s"
+    params = [DEFAULT_COMPANY, from_dt, to_dt]
+
+    if supplier_names:
+        names = [n.strip() for n in supplier_names.split("|||") if n.strip()]
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            where += f" AND pi.supplier_name IN ({ph})"
+            params += names
+
+    if voucher_types:
+        types = [t.strip() for t in voucher_types.split(",") if t.strip()]
+        if types:
+            ph = ",".join(["%s"] * len(types))
+            where += f" AND pi.invoice_type IN ({ph})"
+            params += types
+
+    cursor.execute(f"""
+        SELECT
+            pi.id,
+            pi.invoice_date,
+            pi.bill_number,
+            pi.invoice_type,
+            pi.supplier_name,
+            pi.gross_amount_inc,
+            pi.gross_amount_exc,
+            pi.financial_year,
+            COUNT(pl.id)          AS line_count,
+            SUM(pl.quantity)      AS total_qty
+        FROM purchase_invoices pi
+        LEFT JOIN purchase_lines pl ON pl.purchase_invoice_id = pi.id
+        WHERE {where}
+        GROUP BY pi.id
+        ORDER BY pi.invoice_date DESC, pi.id DESC
+    """, params)
+    vouchers = cursor.fetchall()
+
+    cursor.execute(f"""
+        SELECT
+            COUNT(DISTINCT pi.id)    AS invoice_count,
+            SUM(pi.gross_amount_inc) AS total_amount_inc,
+            SUM(pi.gross_amount_exc) AS total_amount_exc
+        FROM purchase_invoices pi WHERE {where}
+    """, params)
+    summary = cursor.fetchone()
+    cursor.close()
+
+    return {
+        "period": period, "date_from": str(from_dt), "date_to": str(to_dt),
+        "summary": summary, "vouchers": vouchers,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/reports/purchases/vouchers/{invoice_id}/lines
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/purchases/vouchers/{invoice_id}/lines", summary="Line items for a purchase voucher")
+def purchase_voucher_lines(
+    invoice_id: int,
+    payload:    dict = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT * FROM purchase_invoices WHERE id = %s AND company_code = %s",
+        (invoice_id, DEFAULT_COMPANY)
+    )
+    invoice = cursor.fetchone()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Purchase invoice not found.")
+
+    cursor.execute("""
+        SELECT item_code, item_name, quantity, unit,
+               unit_price_exc, tax_rate, unit_price_inc,
+               line_amount_exc, line_amount_inc
+        FROM purchase_lines WHERE purchase_invoice_id = %s ORDER BY id ASC
+    """, (invoice_id,))
+    lines = cursor.fetchall()
+    cursor.close()
+    return {"invoice": invoice, "lines": lines}
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/reports/purchases/items — item-wise purchase report
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/purchases/items", summary="Item-wise purchase report grouped by item")
+def purchases_items_report(
+    period:          str           = Query(default="this_month"),
+    date_from:       Optional[str] = Query(default=None),
+    date_to:         Optional[str] = Query(default=None),
+    tag_ids:         Optional[str] = Query(default=None),
+    supplier_names:  Optional[str] = Query(default=None),
+    voucher_types:   Optional[str] = Query(default=None),
+    payload:         dict          = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    from_dt, to_dt = get_date_range(period, date_from, date_to)
+    cursor = db.cursor(dictionary=True)
+
+    where = "pi.company_code = %s AND pi.invoice_date BETWEEN %s AND %s"
+    params = [DEFAULT_COMPANY, from_dt, to_dt]
+
+    if tag_ids:
+        ids = [x.strip() for x in tag_ids.split(",") if x.strip().isdigit()]
+        if ids:
+            ph = ",".join(["%s"] * len(ids))
+            where += f" AND pl.item_code IN (SELECT item_code FROM item_tag_map WHERE tag_id IN ({ph}) AND company_code = %s)"
+            params += ids + [DEFAULT_COMPANY]
+
+    if supplier_names:
+        names = [n.strip() for n in supplier_names.split("|||") if n.strip()]
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            where += f" AND pi.supplier_name IN ({ph})"
+            params += names
+
+    if voucher_types:
+        types = [t.strip() for t in voucher_types.split(",") if t.strip()]
+        if types:
+            ph = ",".join(["%s"] * len(types))
+            where += f" AND pi.invoice_type IN ({ph})"
+            params += types
+
+    cursor.execute(f"""
+        SELECT
+            pl.item_code,
+            pl.item_name,
+            im.category,
+            im.unit,
+            im.actual_quantity,
+            im.bill_landing,
+            COUNT(DISTINCT pi.id)         AS voucher_count,
+            SUM(pl.quantity)              AS total_qty,
+            SUM(pl.line_amount_inc)       AS total_amount_inc,
+            SUM(pl.line_amount_exc)       AS total_amount_exc,
+            AVG(pl.unit_price_inc)        AS avg_price_inc,
+            MAX(pi.invoice_date)          AS last_purchased
+        FROM purchase_lines pl
+        JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
+        LEFT JOIN item_master im ON im.item_code = pl.item_code AND im.company_code = pi.company_code
+        WHERE {where}
+        GROUP BY pl.item_code, pl.item_name, im.category, im.unit, im.actual_quantity, im.bill_landing
+        ORDER BY total_amount_inc DESC
+    """, params)
+    items = cursor.fetchall()
+
+    cursor.execute(f"""
+        SELECT
+            COUNT(DISTINCT pl.item_code) AS item_count,
+            SUM(pl.line_amount_inc)      AS total_amount_inc,
+            SUM(pl.quantity)             AS total_qty
+        FROM purchase_lines pl
+        JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
+        WHERE {where}
+    """, params)
+    summary = cursor.fetchone()
+    cursor.close()
+
+    return {
+        "period": period, "date_from": str(from_dt), "date_to": str(to_dt),
+        "summary": summary, "items": items,
+    }
