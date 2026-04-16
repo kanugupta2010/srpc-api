@@ -1,891 +1,1024 @@
 """
-routers/inventory.py
+routers/reports.py
 SRPC Enterprises Private Limited
 
-Inventory and purchase management endpoints (admin only):
+Reports + Ledger endpoints:
 
-  POST /admin/purchases/import          — Upload purchase XLSX/CSV
-  GET  /admin/purchases                 — List purchase batches
-  GET  /admin/purchases/{batch_id}      — Batch detail + invoices
-
-  GET  /admin/inventory/stock           — Stock summary for all items
-  GET  /admin/inventory/stock/{item_code} — Single item stock detail
-  PUT  /admin/inventory/threshold/{item_code} — Set reorder threshold
-  GET  /admin/inventory/reorder         — Items below reorder threshold
+  GET /admin/reports/sales              — Sales report with date filter
+  GET /admin/reports/purchases          — Purchase report with date filter
+  GET /admin/contractors/{id}/ledger    — Contractor ledger (own purchases + referred sales)
+  GET /admin/customers                  — Customer list (grouped by mobile or name)
+  GET /admin/customers/{key}/ledger     — Customer ledger (all invoices)
 """
 
 import logging
+from datetime import date, datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query
+from dateutil.relativedelta import relativedelta
 
 from database import get_connection
 from services.dependencies import require_admin
-from services.purchase_import_service import parse_purchase_file
-from services.purchase_service import process_purchase_invoices
 
 log = logging.getLogger(__name__)
-
-router = APIRouter(tags=["Inventory"])
+router = APIRouter(tags=["Reports"])
 
 DEFAULT_COMPANY = "SRPC"
 
 
 # ---------------------------------------------------------------------------
-# Request / Response models
+# Date range helper
 # ---------------------------------------------------------------------------
 
-class ThresholdRequest(BaseModel):
-    reorder_threshold: float
+def get_date_range(period: str, date_from: Optional[str], date_to: Optional[str]):
+    """
+    Returns (from_date, to_date) based on period string.
+    Indian Financial Year runs April–March.
+    """
+    today = date.today()
 
+    def fy_start(year): return date(year, 4, 1)
+    def fy_end(year):   return date(year + 1, 3, 31)
 
-class ImportResponse(BaseModel):
-    batch_id:           int
-    invoices_imported:  int
-    invoices_duplicate: int
-    lines_imported:     int
-    total_amount_inc:   float
-    date_from:          Optional[str]
-    date_to:            Optional[str]
-    notes:              Optional[str]
+    # Current FY year (e.g. 2025 for FY 2025-26)
+    fy_year = today.year if today.month >= 4 else today.year - 1
 
+    # Current quarter start (Apr/Jul/Oct/Jan)
+    q_month = ((today.month - 4) // 3) * 3 + 4
+    if q_month > 12: q_month -= 12
+    q_start = date(today.year if q_month <= today.month else today.year - 1, q_month, 1)
+    q_end   = (q_start + relativedelta(months=3)) - timedelta(days=1)
 
-# ---------------------------------------------------------------------------
-# POST /admin/purchases/import
-# ---------------------------------------------------------------------------
+    # Last quarter
+    lq_start = q_start - relativedelta(months=3)
+    lq_end   = q_start - timedelta(days=1)
 
-@router.post(
-    "/purchases/import",
-    response_model=ImportResponse,
-    summary="Import purchase register XLSX or CSV from Busy 21",
-)
-async def import_purchases(
-    file: UploadFile = File(...),
-    payload: dict = Depends(require_admin),
-    db=Depends(get_connection),
-):
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-    try:
-        invoices, stats = parse_purchase_file(content, file.filename)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-    if not invoices:
-        raise HTTPException(status_code=422, detail="No invoices found in file.")
-
-    cursor = db.cursor(dictionary=True)
-
-    # Create import batch
-    cursor.execute("""
-        INSERT INTO purchase_import_batches (company_code, filename, imported_by)
-        VALUES (%s, %s, %s)
-    """, (DEFAULT_COMPANY, file.filename, payload.get("sub", "admin")))
-    batch_id = cursor.lastrowid
-    db.commit()
-    cursor.close()
-
-    counters = process_purchase_invoices(invoices, batch_id, db, DEFAULT_COMPANY)
-
-    # Fetch final batch record for dates
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM purchase_import_batches WHERE id = %s", (batch_id,))
-    batch = cursor.fetchone()
-    cursor.close()
-
-    return {
-        "batch_id":           batch_id,
-        "invoices_imported":  counters["invoices_imported"],
-        "invoices_duplicate": counters["invoices_duplicate"],
-        "lines_imported":     counters["lines_imported"],
-        "total_amount_inc":   round(counters["total_amount_inc"], 2),
-        "date_from":          str(batch["date_from"]) if batch["date_from"] else None,
-        "date_to":            str(batch["date_to"]) if batch["date_to"] else None,
-        "notes":              counters.get("notes"),
+    ranges = {
+        "today":       (today, today),
+        "yesterday":   (today - timedelta(1), today - timedelta(1)),
+        "last_7":      (today - timedelta(6), today),
+        "last_30":     (today - timedelta(29), today),
+        "this_month":  (today.replace(day=1), today),
+        "last_month":  ((today.replace(day=1) - timedelta(1)).replace(day=1), today.replace(day=1) - timedelta(1)),
+        "this_quarter": (q_start, q_end),
+        "last_quarter": (lq_start, lq_end),
+        "current_fy":  (fy_start(fy_year), fy_end(fy_year)),
+        "last_fy":     (fy_start(fy_year - 1), fy_end(fy_year - 1)),
     }
 
+    if period == "custom":
+        try:
+            return (date.fromisoformat(date_from), date.fromisoformat(date_to))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid date_from or date_to for custom range.")
+
+    if period not in ranges:
+        raise HTTPException(status_code=400, detail=f"Unknown period '{period}'.")
+
+    return ranges[period]
+
 
 # ---------------------------------------------------------------------------
-# GET /admin/purchases
+# GET /admin/reports/sales
 # ---------------------------------------------------------------------------
 
-@router.get(
-    "/purchases",
-    summary="List all purchase import batches",
-)
-def list_purchase_batches(
-    page:      int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    payload:   dict = Depends(require_admin),
+# ---------------------------------------------------------------------------
+# Unit totals helper — groups lt+ml → litres, kg+gm → weight
+# ---------------------------------------------------------------------------
+
+def _compute_unit_totals(items: list, qty_key: str) -> dict:
+    """
+    Only aggregates items that have a valid actual_quantity (e.g. '18lt', '900ml').
+    Items without actual_quantity are skipped.
+    Groups: lt+ml → litres, kg+gm → kg, rest separate.
+    """
+    import re
+    totals = {}
+
+    for row in items:
+        aq  = (row.get("actual_quantity") or "").strip().lower()
+        qty = float(row.get(qty_key) or 0)
+        # Skip items with no valid actual_quantity
+        m   = re.match(r"^([\d.]+)([a-z]+)$", aq)
+        if not m:
+            continue
+
+        vol_per_unit  = float(m.group(1))
+        raw_unit      = m.group(2)
+        total_raw_vol = vol_per_unit * qty
+
+        if raw_unit in ("lt", "ltr", "litre", "litres"):
+            group = "litres"; norm_vol = total_raw_vol
+        elif raw_unit in ("ml", "mlt"):
+            group = "litres"; norm_vol = total_raw_vol / 1000
+        elif raw_unit in ("kg", "kgs"):
+            group = "kg";     norm_vol = total_raw_vol
+        elif raw_unit in ("gm", "gms", "g"):
+            group = "kg";     norm_vol = total_raw_vol / 1000
+        else:
+            group = raw_unit; norm_vol = total_raw_vol
+
+        if group not in totals:
+            totals[group] = 0.0
+        totals[group] = round(totals[group] + norm_vol, 4)
+
+    GROUP_LABELS = {"litres": "lt", "kg": "kg"}
+    result = {}
+    for group, vol in sorted(totals.items()):
+        label = GROUP_LABELS.get(group, group)
+        result[group] = {"total": vol, "display": f"{vol:g} {label}"}
+    return result
+
+
+@router.get("/reports/sales", summary="Sales report with date filter")
+def sales_report(
+    period:        str           = Query(default="this_month"),
+    date_from:     Optional[str] = Query(default=None),
+    date_to:       Optional[str] = Query(default=None),
+    tag_ids:       Optional[str] = Query(default=None, description="Comma-separated tag IDs"),
+    party_names:   Optional[str] = Query(default=None, description="Comma-separated party names"),
+    voucher_types: Optional[str] = Query(default=None, description="Comma-separated voucher types e.g. sale,sale_return"),
+    payload:       dict          = Depends(require_admin),
     db=Depends(get_connection),
 ):
-    offset = (page - 1) * page_size
+    from_dt, to_dt = get_date_range(period, date_from, date_to)
     cursor = db.cursor(dictionary=True)
 
-    cursor.execute(
-        "SELECT COUNT(*) AS total FROM purchase_import_batches WHERE company_code = %s",
-        (DEFAULT_COMPANY,)
-    )
-    total = cursor.fetchone()["total"]
-
-    cursor.execute("""
-        SELECT id, filename, imported_by, invoices_imported, lines_imported,
-               total_amount, date_from, date_to, created_at
-        FROM purchase_import_batches
-        WHERE company_code = %s
-        ORDER BY created_at DESC
-        LIMIT %s OFFSET %s
-    """, (DEFAULT_COMPANY, page_size, offset))
-    batches = cursor.fetchall()
-    cursor.close()
-
-    return {"page": page, "page_size": page_size, "total": total, "batches": batches}
-
-
-# ---------------------------------------------------------------------------
-# GET /admin/purchases/{batch_id}
-# ---------------------------------------------------------------------------
-
-@router.get(
-    "/purchases/{batch_id}",
-    summary="Get purchase batch detail with all invoices",
-)
-def get_purchase_batch(
-    batch_id: int,
-    payload:  dict = Depends(require_admin),
-    db=Depends(get_connection),
-):
-    cursor = db.cursor(dictionary=True)
-
-    cursor.execute(
-        "SELECT * FROM purchase_import_batches WHERE id = %s AND company_code = %s",
-        (batch_id, DEFAULT_COMPANY)
-    )
-    batch = cursor.fetchone()
-    if not batch:
-        raise HTTPException(status_code=404, detail="Batch not found.")
-
-    cursor.execute("""
-        SELECT pi.id, pi.invoice_date, pi.bill_number, pi.supplier_name,
-               pi.invoice_type, pi.gross_amount_exc, pi.gross_amount_inc,
-               COUNT(pl.id) AS line_count
-        FROM purchase_invoices pi
-        LEFT JOIN purchase_lines pl ON pl.purchase_invoice_id = pi.id
-        WHERE pi.import_batch_id = %s AND pi.company_code = %s
-        GROUP BY pi.id
-        ORDER BY pi.invoice_date ASC, pi.id ASC
-    """, (batch_id, DEFAULT_COMPANY))
-    invoices = cursor.fetchall()
-    cursor.close()
-
-    return {"batch": batch, "invoices": invoices}
-
-
-# ---------------------------------------------------------------------------
-# GET /admin/inventory/stock
-# ---------------------------------------------------------------------------
-
-@router.get(
-    "/inventory/stock",
-    summary="Stock summary for all items",
-)
-def get_stock_summary(
-    search:       Optional[str]  = Query(default=None, description="Search item name or code"),
-    needs_reorder: Optional[bool] = Query(default=None, description="Filter items needing reorder"),
-    category:     Optional[str]  = Query(default=None, description="Filter by category"),
-    tag_ids:      Optional[str]  = Query(default=None, description="Comma-separated tag IDs to filter by"),
-    sort_col:     Optional[str]  = Query(default="needs_reorder", description="Column to sort by"),
-    sort_dir:     Optional[str]  = Query(default="desc", description="asc or desc"),
-    page:         int = Query(default=1, ge=1),
-    page_size:    int = Query(default=50, ge=1, le=500),
-    payload:      dict = Depends(require_admin),
-    db=Depends(get_connection),
-):
-    cursor = db.cursor(dictionary=True)
-
-    where = ["company_code = %s"]
-    params = [DEFAULT_COMPANY]
-
-    if search:
-        # Multi-keyword search — "AP Black Enamel" matches items containing ALL words
-        keywords = [w for w in search.strip().split() if w]
-        for kw in keywords:
-            like = f"%{kw}%"
-            where.append("(item_code LIKE %s OR item_name LIKE %s OR item_print_name LIKE %s OR category LIKE %s)")
-            params.extend([like, like, like, like])
-    if needs_reorder is True:
-        where.append("needs_reorder = 1")
-    elif needs_reorder is False:
-        where.append("needs_reorder = 0")
-    if category:
-        where.append("category = %s")
-        params.append(category)
+    # Tag filter subquery
+    tag_filter = ""
+    tag_params: list = []
     if tag_ids:
         ids = [i.strip() for i in tag_ids.split(",") if i.strip().isdigit()]
         if ids:
-            placeholders = ",".join(["%s"] * len(ids))
-            where.append(f"item_code IN (SELECT item_code FROM item_tag_map WHERE tag_id IN ({placeholders}) AND company_code = %s)")
-            params.extend(ids)
-            params.append(DEFAULT_COMPANY)
+            ph = ",".join(["%s"] * len(ids))
+            tag_filter = f"AND i.id IN (SELECT DISTINCT il2.invoice_id FROM invoice_lines il2 JOIN item_tag_map tm ON tm.item_code = il2.item_code WHERE tm.tag_id IN ({ph}) AND tm.company_code = %s)"
+            tag_params = ids + [DEFAULT_COMPANY]
 
-    where_clause = " AND ".join(where)
+    # Party filter
+    if party_names:
+        names = [n.strip() for n in party_names.split("|||") if n.strip()]
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            tag_filter += f" AND i.party_name IN ({ph})"
+            tag_params += names
 
-    # Total count
-    cursor.execute(
-        f"SELECT COUNT(*) AS total FROM vw_stock_summary WHERE {where_clause}",
-        params
-    )
-    total = cursor.fetchone()["total"]
+    # Voucher type filter
+    if voucher_types:
+        types = [t.strip() for t in voucher_types.split(",") if t.strip()]
+        if types:
+            ph = ",".join(["%s"] * len(types))
+            tag_filter += f" AND i.invoice_type IN ({ph})"
+            tag_params += types
 
-    # Paginated results
-    offset = (page - 1) * page_size
-    # Safe column whitelist — prevents SQL injection
-    SORTABLE = {
-        "item_code", "item_name", "category", "unit",
-        "current_stock", "qty_sold", "qty_purchased",
-        "latest_purchase_price_inc", "bill_landing",
-        "reorder_threshold", "needs_reorder", "latest_purchase_date",
-    }
-    # Smart sort options
-    if sort_col == "smart_activity":
-        order_clause = "GREATEST(COALESCE(latest_purchase_date,'1970-01-01'), COALESCE(latest_sale_date,'1970-01-01')) DESC, item_name ASC"
-    elif sort_col == "smart_purchased":
-        order_clause = "latest_purchase_date DESC, item_name ASC"
-    elif sort_col == "smart_sold_date":
-        order_clause = "latest_sale_date DESC, item_name ASC"
-    elif sort_col == "smart_sold":
-        order_clause = "qty_sold DESC, item_name ASC"
-    elif sort_col in SORTABLE:
-        direction = "DESC" if sort_dir == "desc" else "ASC"
-        order_clause = f"{sort_col} {direction}, item_name ASC"
-    else:
-        order_clause = "needs_reorder DESC, item_name ASC"
-
+    # Summary
     cursor.execute(f"""
         SELECT
-            item_code, item_name, item_print_name, category, unit,
-            qty_purchased, qty_purchase_returned,
-            qty_sold, qty_sale_returned,
-            current_stock,
-            latest_purchase_price_exc,
-            latest_purchase_price_inc,
-            latest_purchase_date,
-            latest_sale_date,
-            bill_landing,
-            reorder_threshold,
-            needs_reorder
-        FROM vw_stock_summary
-        WHERE {where_clause}
-        ORDER BY {order_clause}
-        LIMIT %s OFFSET %s
-    """, params + [page_size, offset])
-    items = cursor.fetchall()
+            COUNT(DISTINCT i.id)          AS invoice_count,
+            SUM(i.gross_amount)           AS total_amount,
+            SUM(i.eligible_amount)        AS eligible_amount,
+            SUM(i.points_awarded)         AS points_awarded,
+            COUNT(DISTINCT CASE WHEN i.invoice_type='sale_return' THEN i.id END) AS return_count,
+            SUM(CASE WHEN i.invoice_type='sale_return' THEN i.gross_amount ELSE 0 END) AS return_amount
+        FROM invoices i
+        WHERE i.company_code = %s
+          AND i.invoice_date BETWEEN %s AND %s
+          {tag_filter}
+    """, [DEFAULT_COMPANY, from_dt, to_dt] + tag_params)
+    summary = cursor.fetchone()
 
-    # Summary counts
-    cursor.execute(
-        "SELECT COUNT(*) AS reorder_count FROM vw_stock_summary WHERE company_code = %s AND needs_reorder = 1",
-        (DEFAULT_COMPANY,)
-    )
-    reorder_count = cursor.fetchone()["reorder_count"]
-    cursor.close()
+    # Daily breakdown
+    cursor.execute(f"""
+        SELECT
+            i.invoice_date,
+            i.invoice_type,
+            COUNT(*)              AS invoice_count,
+            SUM(i.gross_amount)   AS total_amount,
+            SUM(i.points_awarded) AS points_awarded
+        FROM invoices i
+        WHERE i.company_code = %s
+          AND i.invoice_date BETWEEN %s AND %s
+          {tag_filter}
+        GROUP BY i.invoice_date, i.invoice_type
+        ORDER BY i.invoice_date ASC
+    """, [DEFAULT_COMPANY, from_dt, to_dt] + tag_params)
+    daily = cursor.fetchall()
 
-    return {
-        "page":          page,
-        "page_size":     page_size,
-        "total":         total,
-        "reorder_count": reorder_count,
-        "items":         items,
-    }
-
-
-# ---------------------------------------------------------------------------
-# GET /admin/inventory/stock/{item_code}
-# ---------------------------------------------------------------------------
-
-@router.get(
-    "/inventory/stock/{item_code}",
-    summary="Single item stock detail with purchase history",
-)
-def get_item_stock_detail(
-    item_code: str,
-    payload:   dict = Depends(require_admin),
-    db=Depends(get_connection),
-):
-    cursor = db.cursor(dictionary=True)
-
-    cursor.execute(
-        "SELECT * FROM vw_stock_summary WHERE company_code = %s AND item_code = %s",
-        (DEFAULT_COMPANY, item_code)
-    )
-    stock = cursor.fetchone()
-    if not stock:
-        raise HTTPException(status_code=404, detail="Item not found.")
-
-    # Purchase history for this item
-    cursor.execute("""
-        SELECT pi.invoice_date, pi.bill_number, pi.supplier_name, pi.invoice_type,
-               pl.quantity, pl.unit, pl.unit_price_exc, pl.unit_price_inc,
-               pl.line_amount_exc, pl.line_amount_inc, pl.tax_rate
-        FROM purchase_lines pl
-        JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
-        WHERE pl.item_code = %s AND pl.company_code = %s
-        ORDER BY pi.invoice_date DESC, pi.id DESC
-        LIMIT 50
-    """, (item_code, DEFAULT_COMPANY))
-    purchase_history = cursor.fetchall()
-
-    # Sales history for this item
-    cursor.execute("""
-        SELECT i.invoice_date, i.bill_number, i.invoice_type, i.customer_type,
-               il.quantity, il.unit, il.unit_price, il.line_amount
-        FROM invoice_lines il
-        JOIN invoices i ON i.id = il.invoice_id
-        WHERE il.item_code = %s AND i.company_code = %s
+    # Invoice list
+    cursor.execute(f"""
+        SELECT
+            i.id, i.invoice_date, i.bill_number, i.invoice_type,
+            i.customer_type, i.party_name, i.party_mobile,
+            i.referred_by_raw, i.contractor_id,
+            i.gross_amount, i.eligible_amount,
+            i.points_awarded, i.points_status,
+            COUNT(il.id) AS line_count
+        FROM invoices i
+        LEFT JOIN invoice_lines il ON il.invoice_id = i.id
+        WHERE i.company_code = %s
+          AND i.invoice_date BETWEEN %s AND %s
+          {tag_filter}
+        GROUP BY i.id
         ORDER BY i.invoice_date DESC, i.id DESC
-        LIMIT 50
-    """, (item_code, DEFAULT_COMPANY))
-    sales_history = cursor.fetchall()
-
+    """, [DEFAULT_COMPANY, from_dt, to_dt] + tag_params)
+    invoices = cursor.fetchall()
     cursor.close()
 
     return {
-        "stock":            stock,
-        "purchase_history": purchase_history,
-        "sales_history":    sales_history,
+        "period":    period,
+        "date_from": str(from_dt),
+        "date_to":   str(to_dt),
+        "summary":   summary,
+        "daily":     daily,
+        "invoices":  invoices,
     }
 
 
 # ---------------------------------------------------------------------------
-# PUT /admin/inventory/threshold/{item_code}
+# GET /admin/reports/purchases
 # ---------------------------------------------------------------------------
 
-@router.put(
-    "/inventory/threshold/{item_code}",
-    summary="Set reorder threshold for an item",
-)
-def set_reorder_threshold(
-    item_code: str,
-    req:       ThresholdRequest,
-    payload:   dict = Depends(require_admin),
+@router.get("/reports/purchases", summary="Purchase report with date filter")
+def purchases_report(
+    period:          str           = Query(default="this_month"),
+    date_from:       Optional[str] = Query(default=None),
+    date_to:         Optional[str] = Query(default=None),
+    tag_ids:         Optional[str] = Query(default=None, description="Comma-separated tag IDs"),
+    supplier_names:  Optional[str] = Query(default=None, description="Pipe-separated supplier names"),
+    voucher_types:   Optional[str] = Query(default=None, description="Comma-separated voucher types"),
+    payload:         dict          = Depends(require_admin),
     db=Depends(get_connection),
 ):
+    from_dt, to_dt = get_date_range(period, date_from, date_to)
     cursor = db.cursor(dictionary=True)
 
-    # Verify item exists
-    cursor.execute(
-        "SELECT item_code FROM item_master WHERE item_code = %s AND is_active = 1",
-        (item_code,)
-    )
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="Item not found in item_master.")
+    # Tag filter subquery
+    tag_filter = ""
+    tag_params: list = []
+    if tag_ids:
+        ids = [i.strip() for i in tag_ids.split(",") if i.strip().isdigit()]
+        if ids:
+            ph = ",".join(["%s"] * len(ids))
+            tag_filter = f"AND pi.id IN (SELECT DISTINCT pl2.purchase_invoice_id FROM purchase_lines pl2 JOIN item_tag_map tm ON tm.item_code = pl2.item_code WHERE tm.tag_id IN ({ph}) AND tm.company_code = %s)"
+            tag_params = ids + [DEFAULT_COMPANY]
 
-    cursor.execute("""
-        UPDATE item_master
-        SET reorder_threshold = %s
-        WHERE item_code = %s AND company_code = %s
-    """, (req.reorder_threshold, item_code, DEFAULT_COMPANY))
-    db.commit()
+    # Supplier filter
+    if supplier_names:
+        names = [n.strip() for n in supplier_names.split("|||") if n.strip()]
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            tag_filter += f" AND pi.supplier_name IN ({ph})"
+            tag_params += names
+
+    # Voucher type filter
+    if voucher_types:
+        types = [t.strip() for t in voucher_types.split(",") if t.strip()]
+        if types:
+            ph = ",".join(["%s"] * len(types))
+            tag_filter += f" AND pi.invoice_type IN ({ph})"
+            tag_params += types
+
+    # Summary
+    cursor.execute(f"""
+        SELECT
+            COUNT(DISTINCT pi.id)              AS invoice_count,
+            SUM(pi.gross_amount_inc)           AS total_amount_inc,
+            SUM(pi.gross_amount_exc)           AS total_amount_exc,
+            COUNT(DISTINCT CASE WHEN pi.invoice_type='purchase_return' THEN pi.id END) AS return_count,
+            SUM(CASE WHEN pi.invoice_type='purchase_return' THEN pi.gross_amount_inc ELSE 0 END) AS return_amount
+        FROM purchase_invoices pi
+        WHERE pi.company_code = %s
+          AND pi.invoice_date BETWEEN %s AND %s
+          {tag_filter}
+    """, [DEFAULT_COMPANY, from_dt, to_dt] + tag_params)
+    summary = cursor.fetchone()
+
+    # Daily breakdown
+    cursor.execute(f"""
+        SELECT
+            pi.invoice_date,
+            pi.invoice_type,
+            COUNT(*)                  AS invoice_count,
+            SUM(pi.gross_amount_inc)  AS total_amount_inc
+        FROM purchase_invoices pi
+        WHERE pi.company_code = %s
+          AND pi.invoice_date BETWEEN %s AND %s
+          {tag_filter}
+        GROUP BY pi.invoice_date, pi.invoice_type
+        ORDER BY pi.invoice_date ASC
+    """, [DEFAULT_COMPANY, from_dt, to_dt] + tag_params)
+    daily = cursor.fetchall()
+
+    # Invoice list
+    cursor.execute(f"""
+        SELECT
+            pi.id, pi.invoice_date, pi.bill_number, pi.invoice_type,
+            pi.supplier_name, pi.gross_amount_inc, pi.gross_amount_exc,
+            pi.financial_year,
+            COUNT(pl.id) AS line_count
+        FROM purchase_invoices pi
+        LEFT JOIN purchase_lines pl ON pl.purchase_invoice_id = pi.id
+        WHERE pi.company_code = %s
+          AND pi.invoice_date BETWEEN %s AND %s
+          {tag_filter}
+        GROUP BY pi.id
+        ORDER BY pi.invoice_date DESC, pi.id DESC
+    """, [DEFAULT_COMPANY, from_dt, to_dt] + tag_params)
+    invoices = cursor.fetchall()
     cursor.close()
 
-    return {"message": f"Threshold updated for {item_code}", "reorder_threshold": req.reorder_threshold}
+    return {
+        "period":    period,
+        "date_from": str(from_dt),
+        "date_to":   str(to_dt),
+        "summary":   summary,
+        "daily":     daily,
+        "invoices":  invoices,
+    }
 
 
 # ---------------------------------------------------------------------------
-# GET /admin/inventory/reorder
+# GET /admin/contractors/{contractor_id}/ledger
 # ---------------------------------------------------------------------------
 
 @router.get(
-    "/inventory/reorder",
-    summary="Items currently below reorder threshold",
+    "/contractors/{contractor_id}/ledger",
+    summary="Contractor ledger — own purchases + referred sales",
 )
-def get_reorder_items(
+def contractor_ledger(
+    contractor_id: int,
     payload: dict = Depends(require_admin),
     db=Depends(get_connection),
 ):
     cursor = db.cursor(dictionary=True)
+
+    # Contractor info
+    cursor.execute(
+        "SELECT * FROM contractors WHERE id = %s AND company_code = %s",
+        (contractor_id, DEFAULT_COMPANY)
+    )
+    contractor = cursor.fetchone()
+    if not contractor:
+        raise HTTPException(status_code=404, detail="Contractor not found.")
+
+    # Sales where contractor is direct buyer (contractor_direct)
     cursor.execute("""
-        SELECT item_code, item_name, item_print_name, category, unit,
-               current_stock, reorder_threshold,
-               latest_purchase_price_inc, latest_purchase_date
-        FROM vw_stock_summary
-        WHERE company_code = %s AND needs_reorder = 1
-        ORDER BY (current_stock / reorder_threshold) ASC
-    """, (DEFAULT_COMPANY,))
-    items = cursor.fetchall()
+        SELECT
+            i.invoice_date, i.bill_number, i.invoice_type,
+            'own_purchase' AS ledger_type,
+            i.party_name, i.party_mobile,
+            i.gross_amount, i.eligible_amount,
+            i.points_awarded, i.points_status,
+            i.financial_year,
+            il.item_code, il.item_name, il.quantity, il.unit,
+            il.unit_price, il.line_amount
+        FROM invoices i
+        JOIN invoice_lines il ON il.invoice_id = i.id
+        WHERE i.company_code = %s
+          AND i.contractor_id = %s
+          AND i.customer_type = 'contractor_direct'
+        ORDER BY i.invoice_date DESC, i.id DESC
+    """, (DEFAULT_COMPANY, contractor_id))
+    own_purchases = cursor.fetchall()
+
+    # Sales referred by this contractor (contractor_referred)
+    cursor.execute("""
+        SELECT
+            i.invoice_date, i.bill_number, i.invoice_type,
+            'referred_sale' AS ledger_type,
+            i.party_name, i.party_mobile,
+            i.gross_amount, i.eligible_amount,
+            i.points_awarded, i.points_status,
+            i.financial_year,
+            il.item_code, il.item_name, il.quantity, il.unit,
+            il.unit_price, il.line_amount
+        FROM invoices i
+        JOIN invoice_lines il ON il.invoice_id = i.id
+        WHERE i.company_code = %s
+          AND i.contractor_id = %s
+          AND i.customer_type = 'contractor_referred'
+        ORDER BY i.invoice_date DESC, i.id DESC
+    """, (DEFAULT_COMPANY, contractor_id))
+    referred_sales = cursor.fetchall()
+
     cursor.close()
 
-    return {"count": len(items), "items": items}
+    # Summary
+    own_total     = sum(float(r["line_amount"] or 0) for r in own_purchases)
+    referred_total = sum(float(r["line_amount"] or 0) for r in referred_sales)
+
+    return {
+        "contractor":    contractor,
+        "own_purchases": own_purchases,
+        "referred_sales": referred_sales,
+        "summary": {
+            "own_purchase_amount":  round(own_total, 2),
+            "referred_sale_amount": round(referred_total, 2),
+            "own_purchase_lines":   len(own_purchases),
+            "referred_sale_lines":  len(referred_sales),
+        }
+    }
 
 
 # ---------------------------------------------------------------------------
-# GET /admin/inventory/ledger/{item_code} — full item ledger
+# GET /admin/customers — customer list grouped by mobile or name
 # ---------------------------------------------------------------------------
 
-@router.get(
-    "/inventory/ledger/{item_code}",
-    summary="Full chronological ledger for an item — purchases, sales, returns",
-)
-def get_item_ledger(
-    item_code:  str,
-    date_from:  Optional[str] = Query(default=None, description="Filter from date YYYY-MM-DD"),
-    date_to:    Optional[str] = Query(default=None, description="Filter to date YYYY-MM-DD"),
+@router.get("/customers", summary="Customer list grouped by mobile or party name")
+def list_customers(
+    search:    Optional[str] = Query(default=None),
+    page:      int           = Query(default=1, ge=1),
+    page_size: int           = Query(default=50, ge=1, le=200),
+    payload:   dict          = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+
+    search_clause = ""
+    params = [DEFAULT_COMPANY]
+    if search:
+        search_clause = "AND (party_name LIKE %s OR party_mobile LIKE %s)"
+        params.extend([f"%{search}%", f"%{search}%"])
+
+    # Group by mobile where available, else by party_name
+    cursor.execute(f"""
+        SELECT
+            COALESCE(NULLIF(party_mobile,''), party_name)  AS customer_key,
+            MAX(party_name)                                AS party_name,
+            MAX(party_mobile)                              AS party_mobile,
+            COUNT(DISTINCT id)                             AS invoice_count,
+            SUM(gross_amount)                              AS total_amount,
+            MAX(invoice_date)                              AS last_transaction,
+            MIN(invoice_date)                              AS first_transaction,
+            SUM(CASE WHEN invoice_type='sale' THEN gross_amount ELSE 0 END) AS sales_amount,
+            SUM(CASE WHEN invoice_type='sale_return' THEN gross_amount ELSE 0 END) AS returns_amount
+        FROM invoices
+        WHERE company_code = %s {search_clause}
+        GROUP BY customer_key
+        ORDER BY last_transaction DESC
+        LIMIT %s OFFSET %s
+    """, params + [page_size, (page - 1) * page_size])
+    customers = cursor.fetchall()
+
+    cursor.execute(f"""
+        SELECT COUNT(DISTINCT COALESCE(NULLIF(party_mobile,''), party_name)) AS total
+        FROM invoices
+        WHERE company_code = %s {search_clause}
+    """, params[:-2] if search else params)
+    total = cursor.fetchone()["total"]
+
+    # Also include purchase suppliers
+    cursor.execute(f"""
+        SELECT
+            supplier_name                  AS customer_key,
+            supplier_name                  AS party_name,
+            NULL                           AS party_mobile,
+            COUNT(DISTINCT id)             AS invoice_count,
+            SUM(gross_amount_inc)          AS total_amount,
+            MAX(invoice_date)              AS last_transaction,
+            MIN(invoice_date)              AS first_transaction,
+            SUM(CASE WHEN invoice_type='purchase' THEN gross_amount_inc ELSE 0 END) AS sales_amount,
+            SUM(CASE WHEN invoice_type='purchase_return' THEN gross_amount_inc ELSE 0 END) AS returns_amount
+        FROM purchase_invoices
+        WHERE company_code = %s
+        {"AND supplier_name LIKE %s" if search else ""}
+        GROUP BY supplier_name
+        ORDER BY last_transaction DESC
+        LIMIT %s OFFSET %s
+    """, ([DEFAULT_COMPANY, f"%{search}%", page_size, (page-1)*page_size] if search
+          else [DEFAULT_COMPANY, page_size, (page-1)*page_size]))
+    suppliers = cursor.fetchall()
+
+    cursor.close()
+    return {
+        "page": page, "page_size": page_size,
+        "total": total,
+        "customers": customers,
+        "suppliers": suppliers,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/customers/{key}/ledger
+# ---------------------------------------------------------------------------
+
+@router.get("/customers/{customer_key}/ledger", summary="Customer ledger — all invoices")
+def customer_ledger(
+    customer_key: str,
+    payload: dict = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+
+    # Sales invoices — match by mobile or name
+    cursor.execute("""
+        SELECT
+            i.invoice_date, i.bill_number, i.invoice_type,
+            'sale' AS source,
+            i.party_name, i.party_mobile,
+            i.gross_amount AS amount,
+            i.financial_year,
+            il.item_code, il.item_name,
+            il.quantity, il.unit,
+            il.unit_price, il.line_amount
+        FROM invoices i
+        JOIN invoice_lines il ON il.invoice_id = i.id
+        WHERE i.company_code = %s
+          AND (
+              (i.party_mobile = %s AND i.party_mobile != '')
+              OR (COALESCE(NULLIF(i.party_mobile,''), i.party_name) = %s)
+          )
+        ORDER BY i.invoice_date DESC, i.id DESC
+    """, (DEFAULT_COMPANY, customer_key, customer_key))
+    sale_lines = cursor.fetchall()
+
+    # Purchase invoices — match by supplier name
+    cursor.execute("""
+        SELECT
+            pi.invoice_date, pi.bill_number, pi.invoice_type,
+            'purchase' AS source,
+            pi.supplier_name AS party_name,
+            NULL AS party_mobile,
+            pi.gross_amount_inc AS amount,
+            pi.financial_year,
+            pl.item_code, pl.item_name,
+            pl.quantity, pl.unit,
+            pl.unit_price_inc AS unit_price,
+            pl.line_amount_inc AS line_amount
+        FROM purchase_invoices pi
+        JOIN purchase_lines pl ON pl.purchase_invoice_id = pi.id
+        WHERE pi.company_code = %s
+          AND pi.supplier_name = %s
+        ORDER BY pi.invoice_date DESC, pi.id DESC
+    """, (DEFAULT_COMPANY, customer_key))
+    purchase_lines = cursor.fetchall()
+    cursor.close()
+
+    all_lines = sale_lines + purchase_lines
+    all_lines.sort(key=lambda x: (x["invoice_date"] or date.min), reverse=True)
+
+    total_sales    = sum(float(r["line_amount"] or 0) for r in sale_lines)
+    total_purchases = sum(float(r["line_amount"] or 0) for r in purchase_lines)
+
+    return {
+        "customer_key": customer_key,
+        "party_name":   sale_lines[0]["party_name"] if sale_lines else purchase_lines[0]["party_name"] if purchase_lines else customer_key,
+        "transactions": all_lines,
+        "summary": {
+            "total_sale_amount":     round(total_sales, 2),
+            "total_purchase_amount": round(total_purchases, 2),
+            "sale_lines":            len(sale_lines),
+            "purchase_lines":        len(purchase_lines),
+        }
+    }
+
+# ---------------------------------------------------------------------------
+# GET /admin/reports/parties — distinct party names for sales filter
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/parties", summary="Distinct party names for sales filter")
+def list_parties(
+    search:  Optional[str] = Query(default=None),
+    payload: dict          = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+    where = "company_code = %s AND party_name IS NOT NULL AND party_name != ''"
+    params = [DEFAULT_COMPANY]
+    if search:
+        where += " AND party_name LIKE %s"
+        params.append(f"%{search}%")
+    cursor.execute(f"""
+        SELECT party_name, COUNT(DISTINCT id) AS invoice_count
+        FROM invoices WHERE {where}
+        GROUP BY party_name ORDER BY party_name ASC LIMIT 100
+    """, params)
+    parties = cursor.fetchall()
+    cursor.close()
+    return {"parties": parties}
+
+
+@router.get("/reports/suppliers", summary="Distinct supplier names for purchase filter")
+def list_suppliers(
+    search:  Optional[str] = Query(default=None),
+    payload: dict          = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+    where = "company_code = %s AND supplier_name IS NOT NULL AND supplier_name != ''"
+    params = [DEFAULT_COMPANY]
+    if search:
+        where += " AND supplier_name LIKE %s"
+        params.append(f"%{search}%")
+    cursor.execute(f"""
+        SELECT supplier_name, COUNT(DISTINCT id) AS invoice_count
+        FROM purchase_invoices WHERE {where}
+        GROUP BY supplier_name ORDER BY supplier_name ASC LIMIT 100
+    """, params)
+    suppliers = cursor.fetchall()
+    cursor.close()
+    return {"suppliers": suppliers}
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/reports/sales/vouchers — voucher-wise sales report
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/sales/vouchers", summary="Voucher-wise sales report")
+def sales_vouchers_report(
+    period:        str           = Query(default="this_month"),
+    date_from:     Optional[str] = Query(default=None),
+    date_to:       Optional[str] = Query(default=None),
+    party_names:   Optional[str] = Query(default=None),
+    voucher_types: Optional[str] = Query(default=None),
+    payload:       dict          = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    from_dt, to_dt = get_date_range(period, date_from, date_to)
+    cursor = db.cursor(dictionary=True)
+
+    where = "i.company_code = %s AND i.invoice_date BETWEEN %s AND %s"
+    params = [DEFAULT_COMPANY, from_dt, to_dt]
+
+    if party_names:
+        names = [n.strip() for n in party_names.split("|||") if n.strip()]
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            where += f" AND i.party_name IN ({ph})"
+            params += names
+
+    if voucher_types:
+        types = [t.strip() for t in voucher_types.split(",") if t.strip()]
+        if types:
+            ph = ",".join(["%s"] * len(types))
+            where += f" AND i.invoice_type IN ({ph})"
+            params += types
+
+    cursor.execute(f"""
+        SELECT
+            i.id,
+            i.invoice_date,
+            i.bill_number,
+            i.invoice_type,
+            i.customer_type,
+            i.party_name,
+            i.party_mobile,
+            i.gross_amount,
+            i.eligible_amount,
+            i.points_awarded,
+            i.points_status,
+            i.financial_year,
+            COUNT(il.id)  AS line_count,
+            SUM(ABS(il.quantity)) AS total_qty
+        FROM invoices i
+        LEFT JOIN invoice_lines il ON il.invoice_id = i.id
+        WHERE {where}
+        GROUP BY i.id
+        ORDER BY i.invoice_date DESC, i.id DESC
+    """, params)
+    vouchers = cursor.fetchall()
+
+    cursor.execute(f"""
+        SELECT
+            COUNT(DISTINCT i.id)  AS invoice_count,
+            SUM(i.gross_amount)   AS total_amount,
+            SUM(i.points_awarded) AS total_points
+        FROM invoices i WHERE {where}
+    """, params)
+    summary = cursor.fetchone()
+    cursor.close()
+
+    return {
+        "period": period, "date_from": str(from_dt), "date_to": str(to_dt),
+        "summary": summary, "vouchers": vouchers,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/reports/sales/vouchers/{invoice_id}/lines — voucher line items
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/sales/vouchers/{invoice_id}/lines", summary="Line items for a sales voucher")
+def sales_voucher_lines(
+    invoice_id: int,
     payload:    dict = Depends(require_admin),
     db=Depends(get_connection),
 ):
     cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT * FROM invoices WHERE id = %s AND company_code = %s",
+        (invoice_id, DEFAULT_COMPANY)
+    )
+    invoice = cursor.fetchone()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found.")
 
-    # Item details
     cursor.execute("""
-        SELECT item_code, item_name, item_print_name, category, unit,
-               bill_landing, reorder_threshold, earns_points, points_rate
-        FROM item_master WHERE item_code = %s AND is_active = 1
-    """, (item_code,))
-    item = cursor.fetchone()
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found.")
+        SELECT item_code, item_name, quantity, unit, unit_price, line_amount
+        FROM invoice_lines WHERE invoice_id = %s ORDER BY id ASC
+    """, (invoice_id,))
+    lines = cursor.fetchall()
+    cursor.close()
+    return {"invoice": invoice, "lines": lines}
 
-    # Build optional date filter
-    date_clause_pi = ""
-    date_clause_i  = ""
-    date_params    = []
-    if date_from and date_to:
-        date_clause_pi = "AND pi.invoice_date BETWEEN %s AND %s"
-        date_clause_i  = "AND i.invoice_date BETWEEN %s AND %s"
-        date_params    = [date_from, date_to]
 
-    def run(q, params): cursor.execute(q, params); return cursor.fetchall()
+# ---------------------------------------------------------------------------
+# GET /admin/reports/sales/items — item-wise sales report
+# ---------------------------------------------------------------------------
 
-    # Purchases
-    purchases = run(f"""
+@router.get("/reports/sales/items", summary="Item-wise sales report grouped by item")
+def sales_items_report(
+    period:        str           = Query(default="this_month"),
+    date_from:     Optional[str] = Query(default=None),
+    date_to:       Optional[str] = Query(default=None),
+    tag_ids:       Optional[str] = Query(default=None),
+    party_names:   Optional[str] = Query(default=None),
+    voucher_types: Optional[str] = Query(default=None),
+    payload:       dict          = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    from_dt, to_dt = get_date_range(period, date_from, date_to)
+    cursor = db.cursor(dictionary=True)
+
+    where = "i.company_code = %s AND i.invoice_date BETWEEN %s AND %s"
+    params = [DEFAULT_COMPANY, from_dt, to_dt]
+
+    if tag_ids:
+        ids = [x.strip() for x in tag_ids.split(",") if x.strip().isdigit()]
+        if ids:
+            ph = ",".join(["%s"] * len(ids))
+            where += f" AND il.item_code IN (SELECT item_code FROM item_tag_map WHERE tag_id IN ({ph}) AND company_code = %s)"
+            params += ids + [DEFAULT_COMPANY]
+
+    if party_names:
+        names = [n.strip() for n in party_names.split("|||") if n.strip()]
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            where += f" AND i.party_name IN ({ph})"
+            params += names
+
+    if voucher_types:
+        types = [t.strip() for t in voucher_types.split(",") if t.strip()]
+        if types:
+            ph = ",".join(["%s"] * len(types))
+            where += f" AND i.invoice_type IN ({ph})"
+            params += types
+
+    cursor.execute(f"""
         SELECT
-            pi.invoice_date    AS txn_date,
-            'purchase'         AS txn_type,
-            pi.bill_number,
-            pi.supplier_name   AS party,
-            NULL               AS party_mobile,
-            pl.quantity,
-            pl.unit,
-            pl.unit_price_inc  AS price,
-            pl.line_amount_inc AS amount,
-            pi.financial_year
-        FROM purchase_lines pl
-        JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
-        WHERE pl.item_code = %s AND pl.company_code = %s
-          AND pi.invoice_type = 'purchase'
-          {date_clause_pi}
-        ORDER BY pi.invoice_date DESC, pi.id DESC
-    """, [item_code, DEFAULT_COMPANY] + date_params)
-
-    # Purchase returns
-    purchase_returns = run(f"""
-        SELECT
-            pi.invoice_date     AS txn_date,
-            'purchase_return'   AS txn_type,
-            pi.bill_number,
-            pi.supplier_name    AS party,
-            NULL                AS party_mobile,
-            pl.quantity,
-            pl.unit,
-            pl.unit_price_inc   AS price,
-            pl.line_amount_inc  AS amount,
-            pi.financial_year
-        FROM purchase_lines pl
-        JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
-        WHERE pl.item_code = %s AND pl.company_code = %s
-          AND pi.invoice_type = 'purchase_return'
-          {date_clause_pi}
-        ORDER BY pi.invoice_date DESC, pi.id DESC
-    """, [item_code, DEFAULT_COMPANY] + date_params)
-
-    # Sales
-    sales = run(f"""
-        SELECT
-            i.invoice_date  AS txn_date,
-            'sale'          AS txn_type,
-            i.bill_number,
-            i.party_name    AS party,
-            i.party_mobile,
-            il.quantity,
-            il.unit,
-            il.unit_price   AS price,
-            il.line_amount  AS amount,
-            i.financial_year
+            il.item_code,
+            il.item_name,
+            im.category,
+            im.unit,
+            im.actual_quantity,
+            im.bill_landing,
+            COUNT(DISTINCT i.id)                     AS voucher_count,
+            SUM(ABS(il.quantity))                    AS total_qty,
+            SUM(ABS(il.line_amount))                 AS total_amount,
+            CASE WHEN SUM(ABS(il.quantity))>0
+                 THEN SUM(ABS(il.line_amount))/SUM(ABS(il.quantity))
+                 ELSE 0 END                          AS avg_price,
+            MAX(i.invoice_date)                      AS last_sold
         FROM invoice_lines il
         JOIN invoices i ON i.id = il.invoice_id
-        WHERE il.item_code = %s AND i.company_code = %s
-          AND i.invoice_type = 'sale'
-          {date_clause_i}
-        ORDER BY i.invoice_date DESC, i.id DESC
-    """, [item_code, DEFAULT_COMPANY] + date_params)
+        LEFT JOIN item_master im ON im.item_code = il.item_code AND im.company_code = i.company_code
+        WHERE {where}
+        GROUP BY il.item_code, il.item_name, im.category, im.unit, im.actual_quantity, im.bill_landing
+        ORDER BY total_amount DESC
+    """, params)
+    items = cursor.fetchall()
 
-    # Sale returns
-    sale_returns = run(f"""
+    cursor.execute(f"""
         SELECT
-            i.invoice_date  AS txn_date,
-            'sale_return'   AS txn_type,
-            i.bill_number,
-            i.party_name    AS party,
-            i.party_mobile,
-            il.quantity,
-            il.unit,
-            il.unit_price   AS price,
-            il.line_amount  AS amount,
-            i.financial_year
+            COUNT(DISTINCT il.item_code) AS item_count,
+            SUM(ABS(il.line_amount))     AS total_amount,
+            SUM(ABS(il.quantity))        AS total_qty
         FROM invoice_lines il
         JOIN invoices i ON i.id = il.invoice_id
-        WHERE il.item_code = %s AND i.company_code = %s
-          AND i.invoice_type = 'sale_return'
-          {date_clause_i}
-        ORDER BY i.invoice_date DESC, i.id DESC
-    """, [item_code, DEFAULT_COMPANY] + date_params)
-
+        WHERE {where}
+    """, params)
+    summary = cursor.fetchone()
     cursor.close()
 
-    # Merge and sort all transactions chronologically
-    all_txns = purchases + purchase_returns + sales + sale_returns
-    # Sort ASC first to calculate running stock correctly (oldest → newest)
-    all_txns.sort(key=lambda x: (x["txn_date"] or "0000-00-00", x["txn_type"]))
+    unit_totals = _compute_unit_totals(items, "total_qty")
 
-    # Calculate running stock in chronological order
-    running_stock = 0.0
-    for txn in all_txns:
-        qty = float(txn["quantity"] or 0)
-        if txn["txn_type"] == "purchase":
-            running_stock += qty
-        elif txn["txn_type"] == "purchase_return":
-            running_stock -= abs(qty)
-        elif txn["txn_type"] == "sale":
-            running_stock -= abs(qty)
-        elif txn["txn_type"] == "sale_return":
-            running_stock += abs(qty)
-        txn["running_stock"] = round(running_stock, 4)
-
-    # Reverse to DESC for display (most recent first)
-    all_txns.reverse()
+    # Add row-wise actual quantity total for each item
+    import re as _re
+    for item in items:
+        aq  = (item.get("actual_quantity") or "").strip().lower()
+        qty = float(item.get("total_qty") or 0)
+        m   = _re.match(r"^([\d.]+)([a-z]+)$", aq)
+        if m:
+            vol_per = float(m.group(1))
+            unit    = m.group(2)
+            total   = round(vol_per * qty, 4)
+            item["row_actual_total"] = f"{total:g}{unit}"
+        else:
+            item["row_actual_total"] = None
 
     return {
-        "item":         item,
-        "date_from":    date_from,
-        "date_to":      date_to,
-        "transactions": all_txns,
-        "summary": {
-            "total_purchased":       sum(float(t["quantity"] or 0) for t in purchases),
-            "total_purchase_returned": sum(abs(float(t["quantity"] or 0)) for t in purchase_returns),
-            "total_sold":            sum(abs(float(t["quantity"] or 0)) for t in sales),
-            "total_sale_returned":   sum(abs(float(t["quantity"] or 0)) for t in sale_returns),
-            "current_stock":         round(running_stock, 4),
-        }
+        "period": period, "date_from": str(from_dt), "date_to": str(to_dt),
+        "summary": {**summary, "unit_totals": unit_totals},
+        "items": items,
     }
 
 
 # ---------------------------------------------------------------------------
-# PUT /admin/inventory/bill-landing/{item_code} — update bill landing price
+# GET /admin/reports/purchases/vouchers — voucher-wise purchase report
 # ---------------------------------------------------------------------------
 
-class BillLandingRequest(BaseModel):
-    bill_landing: Optional[float]
-
-
-@router.put(
-    "/inventory/bill-landing/{item_code}",
-    summary="Update bill landing price for an item",
-)
-def update_bill_landing(
-    item_code: str,
-    req:       BillLandingRequest,
-    payload:   dict = Depends(require_admin),
+@router.get("/reports/purchases/vouchers", summary="Voucher-wise purchase report")
+def purchases_vouchers_report(
+    period:          str           = Query(default="this_month"),
+    date_from:       Optional[str] = Query(default=None),
+    date_to:         Optional[str] = Query(default=None),
+    supplier_names:  Optional[str] = Query(default=None),
+    voucher_types:   Optional[str] = Query(default=None),
+    payload:         dict          = Depends(require_admin),
     db=Depends(get_connection),
 ):
+    from_dt, to_dt = get_date_range(period, date_from, date_to)
     cursor = db.cursor(dictionary=True)
-    cursor.execute(
-        "SELECT item_code FROM item_master WHERE item_code = %s AND is_active = 1",
-        (item_code,)
-    )
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="Item not found.")
 
-    cursor.execute(
-        "UPDATE item_master SET bill_landing = %s WHERE item_code = %s",
-        (req.bill_landing, item_code)
-    )
-    db.commit()
-    cursor.close()
-    return {"message": f"Bill landing updated for {item_code}", "bill_landing": req.bill_landing}
+    where = "pi.company_code = %s AND pi.invoice_date BETWEEN %s AND %s"
+    params = [DEFAULT_COMPANY, from_dt, to_dt]
 
+    if supplier_names:
+        names = [n.strip() for n in supplier_names.split("|||") if n.strip()]
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            where += f" AND pi.supplier_name IN ({ph})"
+            params += names
 
-# ---------------------------------------------------------------------------
-# Tags endpoints
-# ---------------------------------------------------------------------------
-
-# GET /admin/inventory/tags — list all tags with item counts
-@router.get("/inventory/tags", summary="List all tags with item counts and purchase totals")
-def list_tags(
-    payload: dict = Depends(require_admin),
-    db=Depends(get_connection),
-):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("""
-        SELECT
-            t.id,
-            t.tag_name,
-            t.description,
-            COUNT(DISTINCT m.item_code) AS item_count,
-            t.created_at
-        FROM item_tags t
-        LEFT JOIN item_tag_map m ON m.tag_id = t.id AND m.company_code = t.company_code
-        WHERE t.company_code = %s
-        GROUP BY t.id
-        ORDER BY t.tag_name ASC
-    """, (DEFAULT_COMPANY,))
-    tags = cursor.fetchall()
-    cursor.close()
-    return {"tags": tags}
-
-
-# GET /admin/inventory/tags/{tag_id}/items — items under a tag
-@router.get("/inventory/tags/{tag_id}/items", summary="Get all items for a tag")
-def get_tag_items(
-    tag_id:  int,
-    payload: dict = Depends(require_admin),
-    db=Depends(get_connection),
-):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute(
-        "SELECT * FROM item_tags WHERE id = %s AND company_code = %s",
-        (tag_id, DEFAULT_COMPANY)
-    )
-    tag = cursor.fetchone()
-    if not tag:
-        raise HTTPException(status_code=404, detail="Tag not found.")
-
-    cursor.execute("""
-        SELECT im.item_code, im.item_name, im.item_print_name,
-               im.category, im.unit, im.actual_quantity,
-               im.bill_landing, im.reorder_threshold
-        FROM item_tag_map m
-        JOIN item_master im ON im.item_code = m.item_code
-        WHERE m.tag_id = %s AND m.company_code = %s AND im.is_active = 1
-        ORDER BY im.item_name ASC
-    """, (tag_id, DEFAULT_COMPANY))
-    items = cursor.fetchall()
-    cursor.close()
-    return {"tag": tag, "items": items}
-
-
-# GET /admin/inventory/tags/{tag_id}/report — purchase/sale report for a tag
-@router.get("/inventory/tags/{tag_id}/report", summary="Purchase and sale totals for a tag with date filter")
-def get_tag_report(
-    tag_id:    int,
-    date_from: Optional[str] = Query(default=None),
-    date_to:   Optional[str] = Query(default=None),
-    payload:   dict = Depends(require_admin),
-    db=Depends(get_connection),
-):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute(
-        "SELECT * FROM item_tags WHERE id = %s AND company_code = %s",
-        (tag_id, DEFAULT_COMPANY)
-    )
-    tag = cursor.fetchone()
-    if not tag:
-        raise HTTPException(status_code=404, detail="Tag not found.")
-
-    date_filter = ""
-    params_base = [tag_id, DEFAULT_COMPANY]
-    if date_from and date_to:
-        date_filter = "AND pi.invoice_date BETWEEN %s AND %s"
-        params_base += [date_from, date_to]
-
-    # Purchase totals (using actual_quantity weight if available)
-    cursor.execute(f"""
-        SELECT
-            im.item_code,
-            im.item_name,
-            im.unit,
-            im.actual_quantity,
-            SUM(pl.quantity)                AS qty_purchased,
-            SUM(pl.line_amount_inc)         AS amount_inc,
-            MAX(pi.invoice_date)            AS last_purchased
-        FROM item_tag_map m
-        JOIN item_master im       ON im.item_code = m.item_code
-        JOIN purchase_lines pl    ON pl.item_code = m.item_code AND pl.company_code = m.company_code
-        JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
-        WHERE m.tag_id = %s AND m.company_code = %s
-          AND pi.invoice_type = 'purchase'
-          {date_filter}
-        GROUP BY im.item_code, im.item_name, im.unit, im.actual_quantity
-        ORDER BY qty_purchased DESC
-    """, params_base)
-    purchase_items = cursor.fetchall()
-
-    # Sales totals
-    params_sale = [tag_id, DEFAULT_COMPANY]
-    date_filter_sale = ""
-    if date_from and date_to:
-        date_filter_sale = "AND i.invoice_date BETWEEN %s AND %s"
-        params_sale += [date_from, date_to]
+    if voucher_types:
+        types = [t.strip() for t in voucher_types.split(",") if t.strip()]
+        if types:
+            ph = ",".join(["%s"] * len(types))
+            where += f" AND pi.invoice_type IN ({ph})"
+            params += types
 
     cursor.execute(f"""
         SELECT
-            im.item_code,
-            im.item_name,
-            im.unit,
-            im.actual_quantity,
-            SUM(ABS(il.quantity))   AS qty_sold,
-            SUM(ABS(il.line_amount)) AS amount,
-            MAX(i.invoice_date)      AS last_sold
-        FROM item_tag_map m
-        JOIN item_master im   ON im.item_code = m.item_code
-        JOIN invoice_lines il ON il.item_code = m.item_code
-        JOIN invoices i       ON i.id = il.invoice_id AND i.company_code = m.company_code
-        WHERE m.tag_id = %s AND m.company_code = %s
-          AND i.invoice_type = 'sale'
-          {date_filter_sale}
-        GROUP BY im.item_code, im.item_name, im.unit, im.actual_quantity
-        ORDER BY qty_sold DESC
-    """, params_sale)
-    sale_items = cursor.fetchall()
+            pi.id,
+            pi.invoice_date,
+            pi.bill_number,
+            pi.invoice_type,
+            pi.supplier_name,
+            pi.gross_amount_inc,
+            pi.gross_amount_exc,
+            pi.financial_year,
+            COUNT(pl.id)          AS line_count,
+            SUM(pl.quantity)      AS total_qty
+        FROM purchase_invoices pi
+        LEFT JOIN purchase_lines pl ON pl.purchase_invoice_id = pi.id
+        WHERE {where}
+        GROUP BY pi.id
+        ORDER BY pi.invoice_date DESC, pi.id DESC
+    """, params)
+    vouchers = cursor.fetchall()
 
+    cursor.execute(f"""
+        SELECT
+            COUNT(DISTINCT pi.id)    AS invoice_count,
+            SUM(pi.gross_amount_inc) AS total_amount_inc,
+            SUM(pi.gross_amount_exc) AS total_amount_exc
+        FROM purchase_invoices pi WHERE {where}
+    """, params)
+    summary = cursor.fetchone()
     cursor.close()
-
-    total_purchased = sum(float(r["qty_purchased"] or 0) for r in purchase_items)
-    total_sold      = sum(float(r["qty_sold"] or 0) for r in sale_items)
-    total_amt_inc   = sum(float(r["amount_inc"] or 0) for r in purchase_items)
-    total_sale_amt  = sum(float(r["amount"] or 0) for r in sale_items)
-
-    def _unit_totals(items: list, qty_key: str) -> dict:
-        """
-        Group by unit type parsed from actual_quantity.
-        e.g. actual_quantity='18lt' → unit_type='lt', volume=18.0
-        Returns dict: unit_type → {total_volume, item_count, unit_qty_total}
-        """
-        import re
-        totals: dict = {}
-        for row in items:
-            aq  = (row.get("actual_quantity") or "").strip().lower()
-            qty = float(row.get(qty_key) or 0)
-            m   = re.match(r'^([\d.]+)([a-z]+)$', aq)
-            if m:
-                vol      = float(m.group(1))
-                unit_type = m.group(2)   # lt, ml, kg, etc.
-                total_vol = round(vol * qty, 4)
-            else:
-                unit_type = row.get("unit") or "pcs"
-                total_vol = qty
-            if unit_type not in totals:
-                totals[unit_type] = {"total_volume": 0.0, "item_count": 0, "unit_qty": 0.0}
-            totals[unit_type]["total_volume"] = round(totals[unit_type]["total_volume"] + total_vol, 4)
-            totals[unit_type]["item_count"]  += 1
-            totals[unit_type]["unit_qty"]     = round(totals[unit_type]["unit_qty"] + qty, 4)
-        return totals
-
-    purchase_unit_totals = _unit_totals(purchase_items, "qty_purchased")
-    sale_unit_totals     = _unit_totals(sale_items, "qty_sold")
 
     return {
-        "tag":            tag,
-        "date_from":      date_from,
-        "date_to":        date_to,
-        "purchase_items": purchase_items,
-        "sale_items":     sale_items,
-        "purchase_unit_totals": purchase_unit_totals,
-        "sale_unit_totals":     sale_unit_totals,
-        "summary": {
-            "total_qty_purchased":    round(total_purchased, 4),
-            "total_qty_sold":         round(total_sold, 4),
-            "total_amount_inc":       round(total_amt_inc, 2),
-            "total_sale_amount":      round(total_sale_amt, 2),
-            "item_count":             len(set(r["item_code"] for r in purchase_items + sale_items)),
-            "purchase_unit_totals":   purchase_unit_totals,
-            "sale_unit_totals":       sale_unit_totals,
-        }
+        "period": period, "date_from": str(from_dt), "date_to": str(to_dt),
+        "summary": summary, "vouchers": vouchers,
     }
 
 
-# POST /admin/inventory/tags — create a new tag
-@router.post("/inventory/tags", summary="Create a new tag")
-def create_tag(
-    req:     dict,
-    payload: dict = Depends(require_admin),
+# ---------------------------------------------------------------------------
+# GET /admin/reports/purchases/vouchers/{invoice_id}/lines
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/purchases/vouchers/{invoice_id}/lines", summary="Line items for a purchase voucher")
+def purchase_voucher_lines(
+    invoice_id: int,
+    payload:    dict = Depends(require_admin),
     db=Depends(get_connection),
 ):
-    tag_name    = (req.get("tag_name") or "").strip()
-    description = (req.get("description") or "").strip() or None
-    if not tag_name:
-        raise HTTPException(status_code=400, detail="tag_name is required.")
     cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute(
-            "INSERT INTO item_tags (company_code, tag_name, description) VALUES (%s, %s, %s)",
-            (DEFAULT_COMPANY, tag_name, description)
-        )
-        tag_id = cursor.lastrowid
-        db.commit()
-    except Exception:
-        raise HTTPException(status_code=409, detail=f"Tag '{tag_name}' already exists.")
-    cursor.close()
-    return {"id": tag_id, "tag_name": tag_name, "description": description}
+    cursor.execute(
+        "SELECT * FROM purchase_invoices WHERE id = %s AND company_code = %s",
+        (invoice_id, DEFAULT_COMPANY)
+    )
+    invoice = cursor.fetchone()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Purchase invoice not found.")
 
-
-# POST /admin/inventory/tags/bulk-assign — assign tag to items matching a pattern
-@router.post("/inventory/tags/bulk-assign", summary="Bulk assign a tag to items matching a name pattern")
-def bulk_assign_tag(
-    req:     dict,
-    payload: dict = Depends(require_admin),
-    db=Depends(get_connection),
-):
-    tag_id  = req.get("tag_id")
-    pattern = (req.get("pattern") or "").strip()
-    if not tag_id or not pattern:
-        raise HTTPException(status_code=400, detail="tag_id and pattern are required.")
-
-    cursor = db.cursor(dictionary=True)
-
-    # Verify tag exists
-    cursor.execute("SELECT id FROM item_tags WHERE id = %s AND company_code = %s", (tag_id, DEFAULT_COMPANY))
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="Tag not found.")
-
-    # Find matching items
     cursor.execute("""
-        SELECT item_code FROM item_master
-        WHERE company_code = %s AND is_active = 1
-          AND (item_name LIKE %s OR item_print_name LIKE %s OR tags_raw LIKE %s)
-    """, (DEFAULT_COMPANY, f"%{pattern}%", f"%{pattern}%", f"%{pattern}%"))
+        SELECT item_code, item_name, quantity, unit,
+               unit_price_exc, tax_rate, unit_price_inc,
+               line_amount_exc, line_amount_inc
+        FROM purchase_lines WHERE purchase_invoice_id = %s ORDER BY id ASC
+    """, (invoice_id,))
+    lines = cursor.fetchall()
+    cursor.close()
+    return {"invoice": invoice, "lines": lines}
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/reports/purchases/items — item-wise purchase report
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/purchases/items", summary="Item-wise purchase report grouped by item")
+def purchases_items_report(
+    period:          str           = Query(default="this_month"),
+    date_from:       Optional[str] = Query(default=None),
+    date_to:         Optional[str] = Query(default=None),
+    tag_ids:         Optional[str] = Query(default=None),
+    supplier_names:  Optional[str] = Query(default=None),
+    voucher_types:   Optional[str] = Query(default=None),
+    payload:         dict          = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    from_dt, to_dt = get_date_range(period, date_from, date_to)
+    cursor = db.cursor(dictionary=True)
+
+    where = "pi.company_code = %s AND pi.invoice_date BETWEEN %s AND %s"
+    params = [DEFAULT_COMPANY, from_dt, to_dt]
+
+    if tag_ids:
+        ids = [x.strip() for x in tag_ids.split(",") if x.strip().isdigit()]
+        if ids:
+            ph = ",".join(["%s"] * len(ids))
+            where += f" AND pl.item_code IN (SELECT item_code FROM item_tag_map WHERE tag_id IN ({ph}) AND company_code = %s)"
+            params += ids + [DEFAULT_COMPANY]
+
+    if supplier_names:
+        names = [n.strip() for n in supplier_names.split("|||") if n.strip()]
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            where += f" AND pi.supplier_name IN ({ph})"
+            params += names
+
+    if voucher_types:
+        types = [t.strip() for t in voucher_types.split(",") if t.strip()]
+        if types:
+            ph = ",".join(["%s"] * len(types))
+            where += f" AND pi.invoice_type IN ({ph})"
+            params += types
+
+    cursor.execute(f"""
+        SELECT
+            pl.item_code,
+            pl.item_name,
+            im.category,
+            im.unit,
+            im.actual_quantity,
+            im.bill_landing,
+            COUNT(DISTINCT pi.id)                       AS voucher_count,
+            SUM(pl.quantity)                            AS total_qty,
+            SUM(pl.line_amount_inc)                     AS total_amount_inc,
+            SUM(pl.line_amount_exc)                     AS total_amount_exc,
+            CASE WHEN SUM(pl.quantity)>0
+                 THEN SUM(pl.line_amount_inc)/SUM(pl.quantity)
+                 ELSE 0 END                             AS avg_price_inc,
+            MAX(pi.invoice_date)                        AS last_purchased
+        FROM purchase_lines pl
+        JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
+        LEFT JOIN item_master im ON im.item_code = pl.item_code AND im.company_code = pi.company_code
+        WHERE {where}
+        GROUP BY pl.item_code, pl.item_name, im.category, im.unit, im.actual_quantity, im.bill_landing
+        ORDER BY total_amount_inc DESC
+    """, params)
     items = cursor.fetchall()
 
-    if not items:
-        cursor.close()
-        return {"message": "No items matched the pattern.", "assigned": 0}
-
-    cursor.executemany("""
-        INSERT IGNORE INTO item_tag_map (company_code, item_code, tag_id)
-        VALUES (%s, %s, %s)
-    """, [(DEFAULT_COMPANY, r["item_code"], tag_id) for r in items])
-    db.commit()
+    cursor.execute(f"""
+        SELECT
+            COUNT(DISTINCT pl.item_code) AS item_count,
+            SUM(pl.line_amount_inc)      AS total_amount_inc,
+            SUM(pl.quantity)             AS total_qty
+        FROM purchase_lines pl
+        JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
+        WHERE {where}
+    """, params)
+    summary = cursor.fetchone()
     cursor.close()
-    return {"message": f"Tag assigned to {len(items)} items.", "assigned": len(items)}
 
+    unit_totals = _compute_unit_totals(items, "total_qty")
 
-# DELETE /admin/inventory/tags/{tag_id}/items/{item_code} — remove tag from item
-@router.delete(
-    "/inventory/tags/{tag_id}/items/{item_code}",
-    summary="Remove a tag from a specific item",
-)
-def remove_item_tag(
-    tag_id:    int,
-    item_code: str,
-    payload:   dict = Depends(require_admin),
-    db=Depends(get_connection),
-):
-    cursor = db.cursor()
-    cursor.execute(
-        "DELETE FROM item_tag_map WHERE company_code = %s AND tag_id = %s AND item_code = %s",
-        (DEFAULT_COMPANY, tag_id, item_code)
-    )
-    db.commit()
-    cursor.close()
-    return {"message": f"Tag removed from {item_code}."}
+    import re as _re
+    for item in items:
+        aq  = (item.get("actual_quantity") or "").strip().lower()
+        qty = float(item.get("total_qty") or 0)
+        m   = _re.match(r"^([\d.]+)([a-z]+)$", aq)
+        if m:
+            vol_per = float(m.group(1))
+            unit    = m.group(2)
+            total   = round(vol_per * qty, 4)
+            item["row_actual_total"] = f"{total:g}{unit}"
+        else:
+            item["row_actual_total"] = None
+
+    return {
+        "period": period, "date_from": str(from_dt), "date_to": str(to_dt),
+        "summary": {**summary, "unit_totals": unit_totals},
+        "items": items,
+    }

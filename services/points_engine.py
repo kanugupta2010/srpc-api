@@ -165,7 +165,7 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
         inv.party_name, inv.party_mobile or None, inv.referred_by_raw or None,
         inv.invoice_type, inv.contractor_id,
         round(inv.gross_amount, 2), round(eligible_amount, 2),
-        round(total_points, 2), points_status,
+        math.floor(total_points), points_status,
         datetime.utcnow() if points_status == "credited" else None,
     ))
     invoice_id = cursor.lastrowid
@@ -196,7 +196,7 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
                 ) VALUES (%s, %s, %s, 'reversed', %s, %s, %s)
             """, (
                 inv.contractor_id, invoice_id, inv.invoice_date,
-                -round(total_points, 2),
+                -math.floor(total_points),
                 round(eligible_amount, 2),
                 f"Sale return: {inv.bill_number}",
             ))
@@ -210,7 +210,7 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
                 ) VALUES (%s, %s, %s, 'earned', %s, %s, %s, 0)
             """, (
                 inv.contractor_id, invoice_id, inv.invoice_date,
-                round(total_points, 2),
+                math.floor(total_points),
                 round(eligible_amount, 2),
                 expires_at,
             ))
