@@ -292,3 +292,56 @@ def sync_single_item(
         "result":    result,
         "synced_at": datetime.utcnow().isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/sync/recalculate-points — run recalculate_points script
+# ---------------------------------------------------------------------------
+
+import subprocess
+import sys
+
+@router.post(
+    "/sync/recalculate-points",
+    summary="Recalculate all contractor points from invoice history",
+)
+def recalculate_points(
+    dry_run: bool = False,
+    payload: dict = Depends(require_admin),
+):
+    """
+    Runs recalculate_points.py on the server.
+    Clears all points_log entries and recalculates from scratch.
+    Use dry_run=true to preview without making changes.
+    """
+    try:
+        script_path = "/home/srpc/srpc_api/recalculate_points.py"
+        cmd = [sys.executable, script_path]
+        if dry_run:
+            cmd.append("--dry-run")
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,   # 5 min max
+            cwd="/home/srpc/srpc_api",
+        )
+
+        output_lines = (result.stdout + result.stderr).strip().splitlines()
+        # Extract key summary lines
+        summary_lines = [l for l in output_lines if any(k in l for k in
+            ["Inserted","Updated","Skipped","Errors","Total","Points","recalculation","Dry run"])]
+
+        return {
+            "success":    result.returncode == 0,
+            "dry_run":    dry_run,
+            "returncode": result.returncode,
+            "summary":    summary_lines[-20:] if summary_lines else output_lines[-10:],
+            "error":      result.stderr.strip()[-500:] if result.returncode != 0 else None,
+        }
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Recalculation timed out after 5 minutes.")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
