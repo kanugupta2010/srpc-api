@@ -587,3 +587,243 @@ def update_bill_landing(
     db.commit()
     cursor.close()
     return {"message": f"Bill landing updated for {item_code}", "bill_landing": req.bill_landing}
+
+
+# ---------------------------------------------------------------------------
+# Tags endpoints
+# ---------------------------------------------------------------------------
+
+# GET /admin/inventory/tags — list all tags with item counts
+@router.get("/inventory/tags", summary="List all tags with item counts and purchase totals")
+def list_tags(
+    payload: dict = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT
+            t.id,
+            t.tag_name,
+            t.description,
+            COUNT(DISTINCT m.item_code) AS item_count,
+            t.created_at
+        FROM item_tags t
+        LEFT JOIN item_tag_map m ON m.tag_id = t.id AND m.company_code = t.company_code
+        WHERE t.company_code = %s
+        GROUP BY t.id
+        ORDER BY t.tag_name ASC
+    """, (DEFAULT_COMPANY,))
+    tags = cursor.fetchall()
+    cursor.close()
+    return {"tags": tags}
+
+
+# GET /admin/inventory/tags/{tag_id}/items — items under a tag
+@router.get("/inventory/tags/{tag_id}/items", summary="Get all items for a tag")
+def get_tag_items(
+    tag_id:  int,
+    payload: dict = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT * FROM item_tags WHERE id = %s AND company_code = %s",
+        (tag_id, DEFAULT_COMPANY)
+    )
+    tag = cursor.fetchone()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found.")
+
+    cursor.execute("""
+        SELECT im.item_code, im.item_name, im.item_print_name,
+               im.category, im.unit, im.actual_quantity,
+               im.bill_landing, im.reorder_threshold
+        FROM item_tag_map m
+        JOIN item_master im ON im.item_code = m.item_code
+        WHERE m.tag_id = %s AND m.company_code = %s AND im.is_active = 1
+        ORDER BY im.item_name ASC
+    """, (tag_id, DEFAULT_COMPANY))
+    items = cursor.fetchall()
+    cursor.close()
+    return {"tag": tag, "items": items}
+
+
+# GET /admin/inventory/tags/{tag_id}/report — purchase/sale report for a tag
+@router.get("/inventory/tags/{tag_id}/report", summary="Purchase and sale totals for a tag with date filter")
+def get_tag_report(
+    tag_id:    int,
+    date_from: Optional[str] = Query(default=None),
+    date_to:   Optional[str] = Query(default=None),
+    payload:   dict = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT * FROM item_tags WHERE id = %s AND company_code = %s",
+        (tag_id, DEFAULT_COMPANY)
+    )
+    tag = cursor.fetchone()
+    if not tag:
+        raise HTTPException(status_code=404, detail="Tag not found.")
+
+    date_filter = ""
+    params_base = [tag_id, DEFAULT_COMPANY]
+    if date_from and date_to:
+        date_filter = "AND pi.invoice_date BETWEEN %s AND %s"
+        params_base += [date_from, date_to]
+
+    # Purchase totals (using actual_quantity weight if available)
+    cursor.execute(f"""
+        SELECT
+            im.item_code,
+            im.item_name,
+            im.unit,
+            im.actual_quantity,
+            SUM(pl.quantity)                AS qty_purchased,
+            SUM(pl.line_amount_inc)         AS amount_inc,
+            MAX(pi.invoice_date)            AS last_purchased
+        FROM item_tag_map m
+        JOIN item_master im       ON im.item_code = m.item_code
+        JOIN purchase_lines pl    ON pl.item_code = m.item_code AND pl.company_code = m.company_code
+        JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
+        WHERE m.tag_id = %s AND m.company_code = %s
+          AND pi.invoice_type = 'purchase'
+          {date_filter}
+        GROUP BY im.item_code, im.item_name, im.unit, im.actual_quantity
+        ORDER BY qty_purchased DESC
+    """, params_base)
+    purchase_items = cursor.fetchall()
+
+    # Sales totals
+    params_sale = [tag_id, DEFAULT_COMPANY]
+    date_filter_sale = ""
+    if date_from and date_to:
+        date_filter_sale = "AND i.invoice_date BETWEEN %s AND %s"
+        params_sale += [date_from, date_to]
+
+    cursor.execute(f"""
+        SELECT
+            im.item_code,
+            im.item_name,
+            im.unit,
+            im.actual_quantity,
+            SUM(ABS(il.quantity))   AS qty_sold,
+            SUM(ABS(il.line_amount)) AS amount,
+            MAX(i.invoice_date)      AS last_sold
+        FROM item_tag_map m
+        JOIN item_master im   ON im.item_code = m.item_code
+        JOIN invoice_lines il ON il.item_code = m.item_code
+        JOIN invoices i       ON i.id = il.invoice_id AND i.company_code = m.company_code
+        WHERE m.tag_id = %s AND m.company_code = %s
+          AND i.invoice_type = 'sale'
+          {date_filter_sale}
+        GROUP BY im.item_code, im.item_name, im.unit, im.actual_quantity
+        ORDER BY qty_sold DESC
+    """, params_sale)
+    sale_items = cursor.fetchall()
+
+    cursor.close()
+
+    total_purchased = sum(float(r["qty_purchased"] or 0) for r in purchase_items)
+    total_sold      = sum(float(r["qty_sold"] or 0) for r in sale_items)
+    total_amt_inc   = sum(float(r["amount_inc"] or 0) for r in purchase_items)
+
+    return {
+        "tag":            tag,
+        "date_from":      date_from,
+        "date_to":        date_to,
+        "purchase_items": purchase_items,
+        "sale_items":     sale_items,
+        "summary": {
+            "total_qty_purchased": round(total_purchased, 4),
+            "total_qty_sold":      round(total_sold, 4),
+            "total_amount_inc":    round(total_amt_inc, 2),
+            "item_count":          len(set(r["item_code"] for r in purchase_items + sale_items)),
+        }
+    }
+
+
+# POST /admin/inventory/tags — create a new tag
+@router.post("/inventory/tags", summary="Create a new tag")
+def create_tag(
+    req:     dict,
+    payload: dict = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    tag_name    = (req.get("tag_name") or "").strip()
+    description = (req.get("description") or "").strip() or None
+    if not tag_name:
+        raise HTTPException(status_code=400, detail="tag_name is required.")
+    cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "INSERT INTO item_tags (company_code, tag_name, description) VALUES (%s, %s, %s)",
+            (DEFAULT_COMPANY, tag_name, description)
+        )
+        tag_id = cursor.lastrowid
+        db.commit()
+    except Exception:
+        raise HTTPException(status_code=409, detail=f"Tag '{tag_name}' already exists.")
+    cursor.close()
+    return {"id": tag_id, "tag_name": tag_name, "description": description}
+
+
+# POST /admin/inventory/tags/bulk-assign — assign tag to items matching a pattern
+@router.post("/inventory/tags/bulk-assign", summary="Bulk assign a tag to items matching a name pattern")
+def bulk_assign_tag(
+    req:     dict,
+    payload: dict = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    tag_id  = req.get("tag_id")
+    pattern = (req.get("pattern") or "").strip()
+    if not tag_id or not pattern:
+        raise HTTPException(status_code=400, detail="tag_id and pattern are required.")
+
+    cursor = db.cursor(dictionary=True)
+
+    # Verify tag exists
+    cursor.execute("SELECT id FROM item_tags WHERE id = %s AND company_code = %s", (tag_id, DEFAULT_COMPANY))
+    if not cursor.fetchone():
+        raise HTTPException(status_code=404, detail="Tag not found.")
+
+    # Find matching items
+    cursor.execute("""
+        SELECT item_code FROM item_master
+        WHERE company_code = %s AND is_active = 1
+          AND (item_name LIKE %s OR item_print_name LIKE %s OR tags_raw LIKE %s)
+    """, (DEFAULT_COMPANY, f"%{pattern}%", f"%{pattern}%", f"%{pattern}%"))
+    items = cursor.fetchall()
+
+    if not items:
+        cursor.close()
+        return {"message": "No items matched the pattern.", "assigned": 0}
+
+    cursor.executemany("""
+        INSERT IGNORE INTO item_tag_map (company_code, item_code, tag_id)
+        VALUES (%s, %s, %s)
+    """, [(DEFAULT_COMPANY, r["item_code"], tag_id) for r in items])
+    db.commit()
+    cursor.close()
+    return {"message": f"Tag assigned to {len(items)} items.", "assigned": len(items)}
+
+
+# DELETE /admin/inventory/tags/{tag_id}/items/{item_code} — remove tag from item
+@router.delete(
+    "/inventory/tags/{tag_id}/items/{item_code}",
+    summary="Remove a tag from a specific item",
+)
+def remove_item_tag(
+    tag_id:    int,
+    item_code: str,
+    payload:   dict = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor()
+    cursor.execute(
+        "DELETE FROM item_tag_map WHERE company_code = %s AND tag_id = %s AND item_code = %s",
+        (DEFAULT_COMPANY, tag_id, item_code)
+    )
+    db.commit()
+    cursor.close()
+    return {"message": f"Tag removed from {item_code}."}
