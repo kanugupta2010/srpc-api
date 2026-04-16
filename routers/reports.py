@@ -89,18 +89,9 @@ def get_date_range(period: str, date_from: Optional[str], date_to: Optional[str]
 
 def _compute_unit_totals(items: list, qty_key: str) -> dict:
     """
-    For each item parse actual_quantity (e.g. '18lt', '900ml', '40kg', '500gm').
-    Groups:
-      lt + ml  → normalised to litres  (ml / 1000)
-      kg + gm  → normalised to kg      (gm / 1000)
-      pcs/box/etc → kept as-is by unit string
-    Returns dict:
-      {
-        "litres":  {"total": 576.0, "display": "576 lt"},
-        "kg":      {"total": 40.0,  "display": "40 kg"},
-        "pcs":     {"total": 32.0,  "display": "32 pcs"},
-        ...
-      }
+    Only aggregates items that have a valid actual_quantity (e.g. '18lt', '900ml').
+    Items without actual_quantity are skipped.
+    Groups: lt+ml → litres, kg+gm → kg, rest separate.
     """
     import re
     totals = {}
@@ -108,42 +99,35 @@ def _compute_unit_totals(items: list, qty_key: str) -> dict:
     for row in items:
         aq  = (row.get("actual_quantity") or "").strip().lower()
         qty = float(row.get(qty_key) or 0)
+        # Skip items with no valid actual_quantity
         m   = re.match(r"^([\d.]+)([a-z]+)$", aq)
+        if not m:
+            continue
 
-        if m:
-            vol_per_unit  = float(m.group(1))
-            raw_unit      = m.group(2)          # lt, ml, kg, gm, pcs …
-            total_raw_vol = vol_per_unit * qty   # e.g. 18 * 32 = 576
+        vol_per_unit  = float(m.group(1))
+        raw_unit      = m.group(2)
+        total_raw_vol = vol_per_unit * qty
 
-            # Normalise unit groups
-            if raw_unit in ("lt", "ltr", "litre", "litres"):
-                group = "litres"; norm_vol = total_raw_vol
-            elif raw_unit in ("ml", "mlt"):
-                group = "litres"; norm_vol = total_raw_vol / 1000
-            elif raw_unit in ("kg", "kgs"):
-                group = "kg";     norm_vol = total_raw_vol
-            elif raw_unit in ("gm", "gms", "g"):
-                group = "kg";     norm_vol = total_raw_vol / 1000
-            else:
-                group = raw_unit; norm_vol = total_raw_vol
+        if raw_unit in ("lt", "ltr", "litre", "litres"):
+            group = "litres"; norm_vol = total_raw_vol
+        elif raw_unit in ("ml", "mlt"):
+            group = "litres"; norm_vol = total_raw_vol / 1000
+        elif raw_unit in ("kg", "kgs"):
+            group = "kg";     norm_vol = total_raw_vol
+        elif raw_unit in ("gm", "gms", "g"):
+            group = "kg";     norm_vol = total_raw_vol / 1000
         else:
-            # No actual_quantity — fall back to item unit × piece count
-            group    = (row.get("unit") or "pcs").strip().lower()
-            norm_vol = qty
+            group = raw_unit; norm_vol = total_raw_vol
 
         if group not in totals:
             totals[group] = 0.0
         totals[group] = round(totals[group] + norm_vol, 4)
 
-    # Build display strings
     GROUP_LABELS = {"litres": "lt", "kg": "kg"}
     result = {}
     for group, vol in sorted(totals.items()):
         label = GROUP_LABELS.get(group, group)
-        result[group] = {
-            "total":   vol,
-            "display": f"{vol:g} {label}",
-        }
+        result[group] = {"total": vol, "display": f"{vol:g} {label}"}
     return result
 
 
