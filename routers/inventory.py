@@ -196,6 +196,7 @@ def get_stock_summary(
     search:       Optional[str]  = Query(default=None, description="Search item name or code"),
     needs_reorder: Optional[bool] = Query(default=None, description="Filter items needing reorder"),
     category:     Optional[str]  = Query(default=None, description="Filter by category"),
+    tag_ids:      Optional[str]  = Query(default=None, description="Comma-separated tag IDs to filter by"),
     sort_col:     Optional[str]  = Query(default="needs_reorder", description="Column to sort by"),
     sort_dir:     Optional[str]  = Query(default="desc", description="asc or desc"),
     page:         int = Query(default=1, ge=1),
@@ -222,6 +223,13 @@ def get_stock_summary(
     if category:
         where.append("category = %s")
         params.append(category)
+    if tag_ids:
+        ids = [i.strip() for i in tag_ids.split(",") if i.strip().isdigit()]
+        if ids:
+            placeholders = ",".join(["%s"] * len(ids))
+            where.append(f"item_code IN (SELECT item_code FROM item_tag_map WHERE tag_id IN ({placeholders}) AND company_code = %s)")
+            params.extend(ids)
+            params.append(DEFAULT_COMPANY)
 
     where_clause = " AND ".join(where)
 
@@ -727,6 +735,36 @@ def get_tag_report(
     total_purchased = sum(float(r["qty_purchased"] or 0) for r in purchase_items)
     total_sold      = sum(float(r["qty_sold"] or 0) for r in sale_items)
     total_amt_inc   = sum(float(r["amount_inc"] or 0) for r in purchase_items)
+    total_sale_amt  = sum(float(r["amount"] or 0) for r in sale_items)
+
+    def _unit_totals(items: list, qty_key: str) -> dict:
+        """
+        Group by unit type parsed from actual_quantity.
+        e.g. actual_quantity='18lt' → unit_type='lt', volume=18.0
+        Returns dict: unit_type → {total_volume, item_count, unit_qty_total}
+        """
+        import re
+        totals: dict = {}
+        for row in items:
+            aq  = (row.get("actual_quantity") or "").strip().lower()
+            qty = float(row.get(qty_key) or 0)
+            m   = re.match(r'^([\d.]+)([a-z]+)$', aq)
+            if m:
+                vol      = float(m.group(1))
+                unit_type = m.group(2)   # lt, ml, kg, etc.
+                total_vol = round(vol * qty, 4)
+            else:
+                unit_type = row.get("unit") or "pcs"
+                total_vol = qty
+            if unit_type not in totals:
+                totals[unit_type] = {"total_volume": 0.0, "item_count": 0, "unit_qty": 0.0}
+            totals[unit_type]["total_volume"] = round(totals[unit_type]["total_volume"] + total_vol, 4)
+            totals[unit_type]["item_count"]  += 1
+            totals[unit_type]["unit_qty"]     = round(totals[unit_type]["unit_qty"] + qty, 4)
+        return totals
+
+    purchase_unit_totals = _unit_totals(purchase_items, "qty_purchased")
+    sale_unit_totals     = _unit_totals(sale_items, "qty_sold")
 
     return {
         "tag":            tag,
@@ -734,11 +772,16 @@ def get_tag_report(
         "date_to":        date_to,
         "purchase_items": purchase_items,
         "sale_items":     sale_items,
+        "purchase_unit_totals": purchase_unit_totals,
+        "sale_unit_totals":     sale_unit_totals,
         "summary": {
-            "total_qty_purchased": round(total_purchased, 4),
-            "total_qty_sold":      round(total_sold, 4),
-            "total_amount_inc":    round(total_amt_inc, 2),
-            "item_count":          len(set(r["item_code"] for r in purchase_items + sale_items)),
+            "total_qty_purchased":    round(total_purchased, 4),
+            "total_qty_sold":         round(total_sold, 4),
+            "total_amount_inc":       round(total_amt_inc, 2),
+            "total_sale_amount":      round(total_sale_amt, 2),
+            "item_count":             len(set(r["item_code"] for r in purchase_items + sale_items)),
+            "purchase_unit_totals":   purchase_unit_totals,
+            "sale_unit_totals":       sale_unit_totals,
         }
     }
 

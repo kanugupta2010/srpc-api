@@ -88,14 +88,25 @@ def sales_report(
     period:    str           = Query(default="this_month"),
     date_from: Optional[str] = Query(default=None),
     date_to:   Optional[str] = Query(default=None),
+    tag_ids:   Optional[str] = Query(default=None, description="Comma-separated tag IDs"),
     payload:   dict          = Depends(require_admin),
     db=Depends(get_connection),
 ):
     from_dt, to_dt = get_date_range(period, date_from, date_to)
     cursor = db.cursor(dictionary=True)
 
+    # Tag filter subquery
+    tag_filter = ""
+    tag_params: list = []
+    if tag_ids:
+        ids = [i.strip() for i in tag_ids.split(",") if i.strip().isdigit()]
+        if ids:
+            ph = ",".join(["%s"] * len(ids))
+            tag_filter = f"AND i.id IN (SELECT DISTINCT il2.invoice_id FROM invoice_lines il2 JOIN item_tag_map tm ON tm.item_code = il2.item_code WHERE tm.tag_id IN ({ph}) AND tm.company_code = %s)"
+            tag_params = ids + [DEFAULT_COMPANY]
+
     # Summary
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT
             COUNT(DISTINCT i.id)          AS invoice_count,
             SUM(i.gross_amount)           AS total_amount,
@@ -106,11 +117,12 @@ def sales_report(
         FROM invoices i
         WHERE i.company_code = %s
           AND i.invoice_date BETWEEN %s AND %s
-    """, (DEFAULT_COMPANY, from_dt, to_dt))
+          {tag_filter}
+    """, [DEFAULT_COMPANY, from_dt, to_dt] + tag_params)
     summary = cursor.fetchone()
 
     # Daily breakdown
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT
             i.invoice_date,
             i.invoice_type,
@@ -120,13 +132,14 @@ def sales_report(
         FROM invoices i
         WHERE i.company_code = %s
           AND i.invoice_date BETWEEN %s AND %s
+          {tag_filter}
         GROUP BY i.invoice_date, i.invoice_type
         ORDER BY i.invoice_date ASC
-    """, (DEFAULT_COMPANY, from_dt, to_dt))
+    """, [DEFAULT_COMPANY, from_dt, to_dt] + tag_params)
     daily = cursor.fetchall()
 
     # Invoice list
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT
             i.id, i.invoice_date, i.bill_number, i.invoice_type,
             i.customer_type, i.party_name, i.party_mobile,
@@ -138,9 +151,10 @@ def sales_report(
         LEFT JOIN invoice_lines il ON il.invoice_id = i.id
         WHERE i.company_code = %s
           AND i.invoice_date BETWEEN %s AND %s
+          {tag_filter}
         GROUP BY i.id
         ORDER BY i.invoice_date DESC, i.id DESC
-    """, (DEFAULT_COMPANY, from_dt, to_dt))
+    """, [DEFAULT_COMPANY, from_dt, to_dt] + tag_params)
     invoices = cursor.fetchall()
     cursor.close()
 
@@ -163,14 +177,25 @@ def purchases_report(
     period:    str           = Query(default="this_month"),
     date_from: Optional[str] = Query(default=None),
     date_to:   Optional[str] = Query(default=None),
+    tag_ids:   Optional[str] = Query(default=None, description="Comma-separated tag IDs"),
     payload:   dict          = Depends(require_admin),
     db=Depends(get_connection),
 ):
     from_dt, to_dt = get_date_range(period, date_from, date_to)
     cursor = db.cursor(dictionary=True)
 
+    # Tag filter subquery
+    tag_filter = ""
+    tag_params: list = []
+    if tag_ids:
+        ids = [i.strip() for i in tag_ids.split(",") if i.strip().isdigit()]
+        if ids:
+            ph = ",".join(["%s"] * len(ids))
+            tag_filter = f"AND pi.id IN (SELECT DISTINCT pl2.purchase_invoice_id FROM purchase_lines pl2 JOIN item_tag_map tm ON tm.item_code = pl2.item_code WHERE tm.tag_id IN ({ph}) AND tm.company_code = %s)"
+            tag_params = ids + [DEFAULT_COMPANY]
+
     # Summary
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT
             COUNT(DISTINCT pi.id)              AS invoice_count,
             SUM(pi.gross_amount_inc)           AS total_amount_inc,
@@ -180,11 +205,12 @@ def purchases_report(
         FROM purchase_invoices pi
         WHERE pi.company_code = %s
           AND pi.invoice_date BETWEEN %s AND %s
-    """, (DEFAULT_COMPANY, from_dt, to_dt))
+          {tag_filter}
+    """, [DEFAULT_COMPANY, from_dt, to_dt] + tag_params)
     summary = cursor.fetchone()
 
     # Daily breakdown
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT
             pi.invoice_date,
             pi.invoice_type,
@@ -193,13 +219,14 @@ def purchases_report(
         FROM purchase_invoices pi
         WHERE pi.company_code = %s
           AND pi.invoice_date BETWEEN %s AND %s
+          {tag_filter}
         GROUP BY pi.invoice_date, pi.invoice_type
         ORDER BY pi.invoice_date ASC
-    """, (DEFAULT_COMPANY, from_dt, to_dt))
+    """, [DEFAULT_COMPANY, from_dt, to_dt] + tag_params)
     daily = cursor.fetchall()
 
     # Invoice list
-    cursor.execute("""
+    cursor.execute(f"""
         SELECT
             pi.id, pi.invoice_date, pi.bill_number, pi.invoice_type,
             pi.supplier_name, pi.gross_amount_inc, pi.gross_amount_exc,
@@ -209,9 +236,10 @@ def purchases_report(
         LEFT JOIN purchase_lines pl ON pl.purchase_invoice_id = pi.id
         WHERE pi.company_code = %s
           AND pi.invoice_date BETWEEN %s AND %s
+          {tag_filter}
         GROUP BY pi.id
         ORDER BY pi.invoice_date DESC, pi.id DESC
-    """, (DEFAULT_COMPANY, from_dt, to_dt))
+    """, [DEFAULT_COMPANY, from_dt, to_dt] + tag_params)
     invoices = cursor.fetchall()
     cursor.close()
 
