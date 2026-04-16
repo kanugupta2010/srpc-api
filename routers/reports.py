@@ -85,11 +85,13 @@ def get_date_range(period: str, date_from: Optional[str], date_to: Optional[str]
 
 @router.get("/reports/sales", summary="Sales report with date filter")
 def sales_report(
-    period:    str           = Query(default="this_month"),
-    date_from: Optional[str] = Query(default=None),
-    date_to:   Optional[str] = Query(default=None),
-    tag_ids:   Optional[str] = Query(default=None, description="Comma-separated tag IDs"),
-    payload:   dict          = Depends(require_admin),
+    period:        str           = Query(default="this_month"),
+    date_from:     Optional[str] = Query(default=None),
+    date_to:       Optional[str] = Query(default=None),
+    tag_ids:       Optional[str] = Query(default=None, description="Comma-separated tag IDs"),
+    party_names:   Optional[str] = Query(default=None, description="Comma-separated party names"),
+    voucher_types: Optional[str] = Query(default=None, description="Comma-separated voucher types e.g. sale,sale_return"),
+    payload:       dict          = Depends(require_admin),
     db=Depends(get_connection),
 ):
     from_dt, to_dt = get_date_range(period, date_from, date_to)
@@ -104,6 +106,22 @@ def sales_report(
             ph = ",".join(["%s"] * len(ids))
             tag_filter = f"AND i.id IN (SELECT DISTINCT il2.invoice_id FROM invoice_lines il2 JOIN item_tag_map tm ON tm.item_code = il2.item_code WHERE tm.tag_id IN ({ph}) AND tm.company_code = %s)"
             tag_params = ids + [DEFAULT_COMPANY]
+
+    # Party filter
+    if party_names:
+        names = [n.strip() for n in party_names.split("|||") if n.strip()]
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            tag_filter += f" AND i.party_name IN ({ph})"
+            tag_params += names
+
+    # Voucher type filter
+    if voucher_types:
+        types = [t.strip() for t in voucher_types.split(",") if t.strip()]
+        if types:
+            ph = ",".join(["%s"] * len(types))
+            tag_filter += f" AND i.invoice_type IN ({ph})"
+            tag_params += types
 
     # Summary
     cursor.execute(f"""
@@ -174,11 +192,13 @@ def sales_report(
 
 @router.get("/reports/purchases", summary="Purchase report with date filter")
 def purchases_report(
-    period:    str           = Query(default="this_month"),
-    date_from: Optional[str] = Query(default=None),
-    date_to:   Optional[str] = Query(default=None),
-    tag_ids:   Optional[str] = Query(default=None, description="Comma-separated tag IDs"),
-    payload:   dict          = Depends(require_admin),
+    period:          str           = Query(default="this_month"),
+    date_from:       Optional[str] = Query(default=None),
+    date_to:         Optional[str] = Query(default=None),
+    tag_ids:         Optional[str] = Query(default=None, description="Comma-separated tag IDs"),
+    supplier_names:  Optional[str] = Query(default=None, description="Pipe-separated supplier names"),
+    voucher_types:   Optional[str] = Query(default=None, description="Comma-separated voucher types"),
+    payload:         dict          = Depends(require_admin),
     db=Depends(get_connection),
 ):
     from_dt, to_dt = get_date_range(period, date_from, date_to)
@@ -193,6 +213,22 @@ def purchases_report(
             ph = ",".join(["%s"] * len(ids))
             tag_filter = f"AND pi.id IN (SELECT DISTINCT pl2.purchase_invoice_id FROM purchase_lines pl2 JOIN item_tag_map tm ON tm.item_code = pl2.item_code WHERE tm.tag_id IN ({ph}) AND tm.company_code = %s)"
             tag_params = ids + [DEFAULT_COMPANY]
+
+    # Supplier filter
+    if supplier_names:
+        names = [n.strip() for n in supplier_names.split("|||") if n.strip()]
+        if names:
+            ph = ",".join(["%s"] * len(names))
+            tag_filter += f" AND pi.supplier_name IN ({ph})"
+            tag_params += names
+
+    # Voucher type filter
+    if voucher_types:
+        types = [t.strip() for t in voucher_types.split(",") if t.strip()]
+        if types:
+            ph = ",".join(["%s"] * len(types))
+            tag_filter += f" AND pi.invoice_type IN ({ph})"
+            tag_params += types
 
     # Summary
     cursor.execute(f"""
@@ -487,3 +523,50 @@ def customer_ledger(
             "purchase_lines":        len(purchase_lines),
         }
     }
+
+# ---------------------------------------------------------------------------
+# GET /admin/reports/parties — distinct party names for sales filter
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/parties", summary="Distinct party names for sales filter")
+def list_parties(
+    search:  Optional[str] = Query(default=None),
+    payload: dict          = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+    where = "company_code = %s AND party_name IS NOT NULL AND party_name != ''"
+    params = [DEFAULT_COMPANY]
+    if search:
+        where += " AND party_name LIKE %s"
+        params.append(f"%{search}%")
+    cursor.execute(f"""
+        SELECT party_name, COUNT(DISTINCT id) AS invoice_count
+        FROM invoices WHERE {where}
+        GROUP BY party_name ORDER BY party_name ASC LIMIT 100
+    """, params)
+    parties = cursor.fetchall()
+    cursor.close()
+    return {"parties": parties}
+
+
+@router.get("/reports/suppliers", summary="Distinct supplier names for purchase filter")
+def list_suppliers(
+    search:  Optional[str] = Query(default=None),
+    payload: dict          = Depends(require_admin),
+    db=Depends(get_connection),
+):
+    cursor = db.cursor(dictionary=True)
+    where = "company_code = %s AND supplier_name IS NOT NULL AND supplier_name != ''"
+    params = [DEFAULT_COMPANY]
+    if search:
+        where += " AND supplier_name LIKE %s"
+        params.append(f"%{search}%")
+    cursor.execute(f"""
+        SELECT supplier_name, COUNT(DISTINCT id) AS invoice_count
+        FROM purchase_invoices WHERE {where}
+        GROUP BY supplier_name ORDER BY supplier_name ASC LIMIT 100
+    """, params)
+    suppliers = cursor.fetchall()
+    cursor.close()
+    return {"suppliers": suppliers}
