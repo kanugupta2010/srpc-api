@@ -546,9 +546,10 @@ def get_item_ledger(
 
     # Merge and sort all transactions chronologically
     all_txns = purchases + purchase_returns + sales + sale_returns
-    all_txns.sort(key=lambda x: (x["txn_date"] or "0000-00-00", x["txn_type"]), reverse=True)
+    # Sort ASC first to calculate running stock correctly (oldest → newest)
+    all_txns.sort(key=lambda x: (x["txn_date"] or "0000-00-00", x["txn_type"]))
 
-    # Calculate running stock
+    # Calculate running stock in chronological order
     running_stock = 0.0
     for txn in all_txns:
         qty = float(txn["quantity"] or 0)
@@ -561,6 +562,9 @@ def get_item_ledger(
         elif txn["txn_type"] == "sale_return":
             running_stock += abs(qty)
         txn["running_stock"] = round(running_stock, 4)
+
+    # Reverse to DESC for display (most recent first)
+    all_txns.reverse()
 
     return {
         "item":         item,

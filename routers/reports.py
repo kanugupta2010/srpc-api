@@ -83,6 +83,70 @@ def get_date_range(period: str, date_from: Optional[str], date_to: Optional[str]
 # GET /admin/reports/sales
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Unit totals helper — groups lt+ml → litres, kg+gm → weight
+# ---------------------------------------------------------------------------
+
+def _compute_unit_totals(items: list, qty_key: str) -> dict:
+    """
+    For each item parse actual_quantity (e.g. '18lt', '900ml', '40kg', '500gm').
+    Groups:
+      lt + ml  → normalised to litres  (ml / 1000)
+      kg + gm  → normalised to kg      (gm / 1000)
+      pcs/box/etc → kept as-is by unit string
+    Returns dict:
+      {
+        "litres":  {"total": 576.0, "display": "576 lt"},
+        "kg":      {"total": 40.0,  "display": "40 kg"},
+        "pcs":     {"total": 32.0,  "display": "32 pcs"},
+        ...
+      }
+    """
+    import re
+    totals = {}
+
+    for row in items:
+        aq  = (row.get("actual_quantity") or "").strip().lower()
+        qty = float(row.get(qty_key) or 0)
+        m   = re.match(r"^([\d.]+)([a-z]+)$", aq)
+
+        if m:
+            vol_per_unit  = float(m.group(1))
+            raw_unit      = m.group(2)          # lt, ml, kg, gm, pcs …
+            total_raw_vol = vol_per_unit * qty   # e.g. 18 * 32 = 576
+
+            # Normalise unit groups
+            if raw_unit in ("lt", "ltr", "litre", "litres"):
+                group = "litres"; norm_vol = total_raw_vol
+            elif raw_unit in ("ml", "mlt"):
+                group = "litres"; norm_vol = total_raw_vol / 1000
+            elif raw_unit in ("kg", "kgs"):
+                group = "kg";     norm_vol = total_raw_vol
+            elif raw_unit in ("gm", "gms", "g"):
+                group = "kg";     norm_vol = total_raw_vol / 1000
+            else:
+                group = raw_unit; norm_vol = total_raw_vol
+        else:
+            # No actual_quantity — fall back to item unit × piece count
+            group    = (row.get("unit") or "pcs").strip().lower()
+            norm_vol = qty
+
+        if group not in totals:
+            totals[group] = 0.0
+        totals[group] = round(totals[group] + norm_vol, 4)
+
+    # Build display strings
+    GROUP_LABELS = {"litres": "lt", "kg": "kg"}
+    result = {}
+    for group, vol in sorted(totals.items()):
+        label = GROUP_LABELS.get(group, group)
+        result[group] = {
+            "total":   vol,
+            "display": f"{vol:g} {label}",
+        }
+    return result
+
+
 @router.get("/reports/sales", summary="Sales report with date filter")
 def sales_report(
     period:        str           = Query(default="this_month"),
@@ -724,11 +788,13 @@ def sales_items_report(
             im.unit,
             im.actual_quantity,
             im.bill_landing,
-            COUNT(DISTINCT i.id)          AS voucher_count,
-            SUM(ABS(il.quantity))         AS total_qty,
-            SUM(ABS(il.line_amount))      AS total_amount,
-            AVG(ABS(il.unit_price))       AS avg_price,
-            MAX(i.invoice_date)           AS last_sold
+            COUNT(DISTINCT i.id)                     AS voucher_count,
+            SUM(ABS(il.quantity))                    AS total_qty,
+            SUM(ABS(il.line_amount))                 AS total_amount,
+            CASE WHEN SUM(ABS(il.quantity))>0
+                 THEN SUM(ABS(il.line_amount))/SUM(ABS(il.quantity))
+                 ELSE 0 END                          AS avg_price,
+            MAX(i.invoice_date)                      AS last_sold
         FROM invoice_lines il
         JOIN invoices i ON i.id = il.invoice_id
         LEFT JOIN item_master im ON im.item_code = il.item_code AND im.company_code = i.company_code
@@ -750,9 +816,26 @@ def sales_items_report(
     summary = cursor.fetchone()
     cursor.close()
 
+    unit_totals = _compute_unit_totals(items, "total_qty")
+
+    # Add row-wise actual quantity total for each item
+    import re as _re
+    for item in items:
+        aq  = (item.get("actual_quantity") or "").strip().lower()
+        qty = float(item.get("total_qty") or 0)
+        m   = _re.match(r"^([\d.]+)([a-z]+)$", aq)
+        if m:
+            vol_per = float(m.group(1))
+            unit    = m.group(2)
+            total   = round(vol_per * qty, 4)
+            item["row_actual_total"] = f"{total:g}{unit}"
+        else:
+            item["row_actual_total"] = None
+
     return {
         "period": period, "date_from": str(from_dt), "date_to": str(to_dt),
-        "summary": summary, "items": items,
+        "summary": {**summary, "unit_totals": unit_totals},
+        "items": items,
     }
 
 
@@ -906,12 +989,14 @@ def purchases_items_report(
             im.unit,
             im.actual_quantity,
             im.bill_landing,
-            COUNT(DISTINCT pi.id)         AS voucher_count,
-            SUM(pl.quantity)              AS total_qty,
-            SUM(pl.line_amount_inc)       AS total_amount_inc,
-            SUM(pl.line_amount_exc)       AS total_amount_exc,
-            AVG(pl.unit_price_inc)        AS avg_price_inc,
-            MAX(pi.invoice_date)          AS last_purchased
+            COUNT(DISTINCT pi.id)                       AS voucher_count,
+            SUM(pl.quantity)                            AS total_qty,
+            SUM(pl.line_amount_inc)                     AS total_amount_inc,
+            SUM(pl.line_amount_exc)                     AS total_amount_exc,
+            CASE WHEN SUM(pl.quantity)>0
+                 THEN SUM(pl.line_amount_inc)/SUM(pl.quantity)
+                 ELSE 0 END                             AS avg_price_inc,
+            MAX(pi.invoice_date)                        AS last_purchased
         FROM purchase_lines pl
         JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
         LEFT JOIN item_master im ON im.item_code = pl.item_code AND im.company_code = pi.company_code
@@ -933,7 +1018,23 @@ def purchases_items_report(
     summary = cursor.fetchone()
     cursor.close()
 
+    unit_totals = _compute_unit_totals(items, "total_qty")
+
+    import re as _re
+    for item in items:
+        aq  = (item.get("actual_quantity") or "").strip().lower()
+        qty = float(item.get("total_qty") or 0)
+        m   = _re.match(r"^([\d.]+)([a-z]+)$", aq)
+        if m:
+            vol_per = float(m.group(1))
+            unit    = m.group(2)
+            total   = round(vol_per * qty, 4)
+            item["row_actual_total"] = f"{total:g}{unit}"
+        else:
+            item["row_actual_total"] = None
+
     return {
         "period": period, "date_from": str(from_dt), "date_to": str(to_dt),
-        "summary": summary, "items": items,
+        "summary": {**summary, "unit_totals": unit_totals},
+        "items": items,
     }
