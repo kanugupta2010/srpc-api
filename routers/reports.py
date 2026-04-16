@@ -12,6 +12,7 @@ Reports + Ledger endpoints:
 """
 
 import logging
+import re
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -93,7 +94,6 @@ def _compute_unit_totals(items: list, qty_key: str) -> dict:
     Items without actual_quantity are skipped.
     Groups: lt+ml → litres, kg+gm → kg, rest separate.
     """
-    import re
     totals = {}
 
     for row in items:
@@ -803,11 +803,10 @@ def sales_items_report(
     unit_totals = _compute_unit_totals(items, "total_qty")
 
     # Add row-wise actual quantity total for each item
-    import re as _re
     for item in items:
         aq  = (item.get("actual_quantity") or "").strip().lower()
         qty = float(item.get("total_qty") or 0)
-        m   = _re.match(r"^([\d.]+)([a-z]+)$", aq)
+        m   = re.match(r"^([\d.]+)([a-z]+)$", aq)
         if m:
             vol_per = float(m.group(1))
             unit    = m.group(2)
@@ -1003,12 +1002,10 @@ def purchases_items_report(
     cursor.close()
 
     unit_totals = _compute_unit_totals(items, "total_qty")
-
-    import re as _re
     for item in items:
         aq  = (item.get("actual_quantity") or "").strip().lower()
         qty = float(item.get("total_qty") or 0)
-        m   = _re.match(r"^([\d.]+)([a-z]+)$", aq)
+        m   = re.match(r"^([\d.]+)([a-z]+)$", aq)
         if m:
             vol_per = float(m.group(1))
             unit    = m.group(2)

@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from pydantic import BaseModel
 
 from database import get_connection
+import re
 from services.dependencies import require_admin
 from services.purchase_import_service import parse_purchase_file
 from services.purchase_service import process_purchase_invoices
@@ -795,7 +796,6 @@ def get_tag_report(
         e.g. actual_quantity='18lt' → unit_type='lt', volume=18.0
         Returns dict: unit_type → {total_volume, item_count, unit_qty_total}
         """
-        import re
         totals: dict = {}
         for row in items:
             aq  = (row.get("actual_quantity") or "").strip().lower()
