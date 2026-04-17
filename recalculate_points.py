@@ -97,11 +97,11 @@ def load_contractors(cursor) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Points formula
+# Points formula — always returns a whole number (floor to 0 decimals)
 # ---------------------------------------------------------------------------
 
-def calculate_points(amount: float, points_rate: float, points_base: float) -> float:
-    return math.floor(abs(amount) / points_base) * points_rate
+def calculate_points(amount: float, points_rate: float, points_base: float) -> int:
+    return math.floor(math.floor(abs(amount) / points_base) * points_rate)
 
 
 def calculate_tier(total_earned: float, settings: dict) -> str:
@@ -167,7 +167,7 @@ def recalculate(dry_run: bool = False) -> None:
 
     # --- Step 4: Process each invoice ---
     new_log_entries          = 0
-    total_points             = 0.0
+    total_points             = 0
     invoice_updates          = []   # (eligible_amount, points_awarded, points_status, id)
     line_updates             = []   # (earns_points, points_rate, eligible_amount, line_id)
     contractor_ids_affected: set[int] = set()
@@ -183,7 +183,7 @@ def recalculate(dry_run: bool = False) -> None:
 
         # Recalculate per line using current item_master
         eligible_amount = 0.0
-        inv_points      = 0.0
+        inv_points      = 0       # integer — points are always whole numbers
 
         for line in lines:
             item_info    = item_master.get(line["item_code"])
@@ -206,19 +206,19 @@ def recalculate(dry_run: bool = False) -> None:
         # Determine points_status
         if not contractor_id:
             points_status = "not_applicable"
-            inv_points    = 0.0
+            inv_points    = 0
         elif contractor_status != "approved":
             points_status = "pending"
-            inv_points    = 0.0
+            inv_points    = 0
         elif eligible_amount == 0 or inv_points == 0:
             points_status = "skipped"
-            inv_points    = 0.0
+            inv_points    = 0
         else:
             points_status = "credited"
 
         invoice_updates.append((
             round(eligible_amount, 2),
-            round(inv_points, 2),
+            inv_points,          # whole integer
             points_status,
             inv_id,
         ))
@@ -232,10 +232,10 @@ def recalculate(dry_run: bool = False) -> None:
 
             is_return  = invoice_type == "sale_return"
             event_type = "reversed" if is_return else "earned"
-            signed_pts = -round(inv_points, 2) if is_return else round(inv_points, 2)
+            signed_pts = -inv_points if is_return else inv_points
 
             log.info(
-                "  %s %s | contractor %d | eligible ₹%.2f | points %.2f",
+                "  %s %s | contractor %d | eligible ₹%.2f | points %d",
                 event_type.upper(), inv["bill_number"],
                 contractor_id, eligible_amount, inv_points,
             )
@@ -264,7 +264,7 @@ def recalculate(dry_run: bool = False) -> None:
                     ))
 
             new_log_entries += 1
-            total_points    += abs(inv_points)
+            total_points    += inv_points
             contractor_ids_affected.add(contractor_id)
 
     # --- Step 5: Update invoice records ---
@@ -303,10 +303,10 @@ def recalculate(dry_run: bool = False) -> None:
         """, (cid,))
         row = cursor.fetchone()
 
-        total_earned      = float(row["total_earned"])
-        total_redeemed    = float(row["total_redeemed"])
-        total_expired     = float(row["total_expired"])
-        total_adjustments = float(row["total_adjustments"])
+        total_earned      = math.floor(float(row["total_earned"]))
+        total_redeemed    = math.floor(float(row["total_redeemed"]))
+        total_expired     = math.floor(float(row["total_expired"]))
+        total_adjustments = math.floor(float(row["total_adjustments"]))
         balance           = total_earned - total_redeemed - total_expired + total_adjustments
         tier              = calculate_tier(total_earned, settings)
 
@@ -319,12 +319,12 @@ def recalculate(dry_run: bool = False) -> None:
                 tier                  = %s
             WHERE id = %s
         """, (
-            round(total_earned, 2), round(total_redeemed, 2),
-            round(total_expired, 2), round(balance, 2),
+            total_earned, total_redeemed,
+            total_expired, balance,
             tier, cid,
         ))
         log.info(
-            "  Contractor %d — earned: %.2f | balance: %.2f | tier: %s",
+            "  Contractor %d — earned: %d | balance: %d | tier: %s",
             cid, total_earned, balance, tier,
         )
 
@@ -339,7 +339,7 @@ def recalculate(dry_run: bool = False) -> None:
     log.info("  Invoices processed         : %d", len(invoices))
     log.info("  Invoice lines refreshed    : %d", len(line_updates))
     log.info("  Points log entries written : %d", new_log_entries)
-    log.info("  Total points               : %.2f", total_points)
+    log.info("  Total points               : %d", total_points)
     log.info("  Contractors updated        : %d", len(contractor_ids_affected))
     if dry_run:
         log.info("  *** DRY RUN — no changes written to DB ***")
