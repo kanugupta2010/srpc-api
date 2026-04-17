@@ -445,8 +445,8 @@ def get_item_ledger(
         FROM item_master WHERE item_code = %s AND is_active = 1
     """, (item_code,))
     item = cursor.fetchone()
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found.")
+    # Don't 404 — item may exist in transactions but not item_master
+    # Return null item and still fetch ledger transactions
 
     # Build optional date filter
     date_clause_pi = ""
