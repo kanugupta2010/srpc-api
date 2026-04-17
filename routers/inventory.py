@@ -235,7 +235,7 @@ def get_stock_summary(
 
     # Total count
     cursor.execute(
-        f"SELECT COUNT(*) AS total FROM vw_stock_summary WHERE {where_clause}",
+        f"SELECT COUNT(*) AS total FROM vw_stock_summary v WHERE {where_clause}",
         params
     )
     total = cursor.fetchone()["total"]
@@ -290,7 +290,7 @@ def get_stock_summary(
 
     # Summary counts
     cursor.execute(
-        "SELECT COUNT(*) AS reorder_count FROM vw_stock_summary WHERE company_code = %s AND needs_reorder = 1",
+        "SELECT COUNT(*) AS reorder_count FROM vw_stock_summary v WHERE v.company_code = %s AND v.needs_reorder = 1",
         (DEFAULT_COMPANY,)
     )
     reorder_count = cursor.fetchone()["reorder_count"]
