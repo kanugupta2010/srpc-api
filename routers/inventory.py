@@ -21,7 +21,6 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from pydantic import BaseModel
 
 from database import get_connection
-import re
 from services.dependencies import require_admin
 from services.purchase_import_service import parse_purchase_file
 from services.purchase_service import process_purchase_invoices
@@ -267,18 +266,22 @@ def get_stock_summary(
 
     cursor.execute(f"""
         SELECT
-            item_code, item_name, item_print_name, category, unit,
-            qty_purchased, qty_purchase_returned,
-            qty_sold, qty_sale_returned,
-            current_stock,
-            latest_purchase_price_exc,
-            latest_purchase_price_inc,
-            latest_purchase_date,
-            latest_sale_date,
-            bill_landing,
-            reorder_threshold,
-            needs_reorder
-        FROM vw_stock_summary
+            v.item_code, v.item_name, v.item_print_name, v.category, v.unit,
+            v.qty_purchased, v.qty_purchase_returned,
+            v.qty_sold, v.qty_sale_returned,
+            v.current_stock,
+            v.latest_purchase_price_exc,
+            v.latest_purchase_price_inc,
+            v.latest_purchase_date,
+            v.latest_sale_date,
+            v.bill_landing,
+            v.reorder_threshold,
+            v.needs_reorder,
+            im.sale_price_inc_gst,
+            im.kacha_sale_price
+        FROM vw_stock_summary v
+        LEFT JOIN item_master im
+            ON im.item_code = v.item_code AND im.company_code = v.company_code
         WHERE {where_clause}
         ORDER BY {order_clause}
         LIMIT %s OFFSET %s
@@ -430,10 +433,8 @@ def get_reorder_items(
     summary="Full chronological ledger for an item — purchases, sales, returns",
 )
 def get_item_ledger(
-    item_code:  str,
-    date_from:  Optional[str] = Query(default=None, description="Filter from date YYYY-MM-DD"),
-    date_to:    Optional[str] = Query(default=None, description="Filter to date YYYY-MM-DD"),
-    payload:    dict = Depends(require_admin),
+    item_code: str,
+    payload:   dict = Depends(require_admin),
     db=Depends(get_connection),
 ):
     cursor = db.cursor(dictionary=True)
@@ -445,22 +446,11 @@ def get_item_ledger(
         FROM item_master WHERE item_code = %s AND is_active = 1
     """, (item_code,))
     item = cursor.fetchone()
-    # Don't 404 — item may exist in transactions but not item_master
-    # Return null item and still fetch ledger transactions
-
-    # Build optional date filter
-    date_clause_pi = ""
-    date_clause_i  = ""
-    date_params    = []
-    if date_from and date_to:
-        date_clause_pi = "AND pi.invoice_date BETWEEN %s AND %s"
-        date_clause_i  = "AND i.invoice_date BETWEEN %s AND %s"
-        date_params    = [date_from, date_to]
-
-    def run(q, params): cursor.execute(q, params); return cursor.fetchall()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found.")
 
     # Purchases
-    purchases = run(f"""
+    cursor.execute("""
         SELECT
             pi.invoice_date    AS txn_date,
             'purchase'         AS txn_type,
@@ -476,12 +466,12 @@ def get_item_ledger(
         JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
         WHERE pl.item_code = %s AND pl.company_code = %s
           AND pi.invoice_type = 'purchase'
-          {date_clause_pi}
-        ORDER BY pi.invoice_date DESC, pi.id DESC
-    """, [item_code, DEFAULT_COMPANY] + date_params)
+        ORDER BY pi.invoice_date ASC, pi.id ASC
+    """, (item_code, DEFAULT_COMPANY))
+    purchases = cursor.fetchall()
 
     # Purchase returns
-    purchase_returns = run(f"""
+    cursor.execute("""
         SELECT
             pi.invoice_date     AS txn_date,
             'purchase_return'   AS txn_type,
@@ -497,12 +487,12 @@ def get_item_ledger(
         JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
         WHERE pl.item_code = %s AND pl.company_code = %s
           AND pi.invoice_type = 'purchase_return'
-          {date_clause_pi}
-        ORDER BY pi.invoice_date DESC, pi.id DESC
-    """, [item_code, DEFAULT_COMPANY] + date_params)
+        ORDER BY pi.invoice_date ASC, pi.id ASC
+    """, (item_code, DEFAULT_COMPANY))
+    purchase_returns = cursor.fetchall()
 
     # Sales
-    sales = run(f"""
+    cursor.execute("""
         SELECT
             i.invoice_date  AS txn_date,
             'sale'          AS txn_type,
@@ -518,12 +508,12 @@ def get_item_ledger(
         JOIN invoices i ON i.id = il.invoice_id
         WHERE il.item_code = %s AND i.company_code = %s
           AND i.invoice_type = 'sale'
-          {date_clause_i}
-        ORDER BY i.invoice_date DESC, i.id DESC
-    """, [item_code, DEFAULT_COMPANY] + date_params)
+        ORDER BY i.invoice_date ASC, i.id ASC
+    """, (item_code, DEFAULT_COMPANY))
+    sales = cursor.fetchall()
 
     # Sale returns
-    sale_returns = run(f"""
+    cursor.execute("""
         SELECT
             i.invoice_date  AS txn_date,
             'sale_return'   AS txn_type,
@@ -539,53 +529,18 @@ def get_item_ledger(
         JOIN invoices i ON i.id = il.invoice_id
         WHERE il.item_code = %s AND i.company_code = %s
           AND i.invoice_type = 'sale_return'
-          {date_clause_i}
-        ORDER BY i.invoice_date DESC, i.id DESC
-    """, [item_code, DEFAULT_COMPANY] + date_params)
-
-    # Merge and sort all transactions chronologically
-    all_txns = purchases + purchase_returns + sales + sale_returns
-    # Sort ASC first to calculate running stock correctly (oldest → newest)
-    all_txns.sort(key=lambda x: (x["txn_date"] or "0000-00-00", x["txn_type"]))
-
-    # If date-filtered, fetch opening stock (stock before date_from)
-    opening_stock = 0.0
-    if not date_from:
-        cursor.close()
-    if date_from:
-        # Sum all transactions strictly before date_from
-        cursor.execute("""
-            SELECT
-                COALESCE(SUM(CASE WHEN pi.invoice_type='purchase' THEN pl.quantity ELSE 0 END), 0)
-                - COALESCE(SUM(CASE WHEN pi.invoice_type='purchase_return' THEN ABS(pl.quantity) ELSE 0 END), 0)
-                AS net_purchased
-            FROM purchase_lines pl
-            JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
-            WHERE pl.item_code = %s AND pl.company_code = %s
-              AND pi.invoice_date < %s
-        """, (item_code, DEFAULT_COMPANY, date_from))
-        row = cursor.fetchone()
-        purchase_opening = float((row or {}).get("net_purchased") or 0)
-
-        cursor.execute("""
-            SELECT
-                COALESCE(SUM(CASE WHEN i.invoice_type='sale' THEN ABS(il.quantity) ELSE 0 END), 0)
-                - COALESCE(SUM(CASE WHEN i.invoice_type='sale_return' THEN ABS(il.quantity) ELSE 0 END), 0)
-                AS net_sold
-            FROM invoice_lines il
-            JOIN invoices i ON i.id = il.invoice_id
-            WHERE il.item_code = %s AND i.company_code = %s
-              AND i.invoice_date < %s
-        """, (item_code, DEFAULT_COMPANY, date_from))
-        row = cursor.fetchone()
-        sale_opening = float((row or {}).get("net_sold") or 0)
-
-        opening_stock = round(purchase_opening - sale_opening, 4)
+        ORDER BY i.invoice_date ASC, i.id ASC
+    """, (item_code, DEFAULT_COMPANY))
+    sale_returns = cursor.fetchall()
 
     cursor.close()
 
-    # Calculate running stock in chronological order, starting from opening_stock
-    running_stock = opening_stock
+    # Merge and sort all transactions chronologically
+    all_txns = purchases + purchase_returns + sales + sale_returns
+    all_txns.sort(key=lambda x: (x["txn_date"] or "0000-00-00", x["txn_type"]))
+
+    # Calculate running stock
+    running_stock = 0.0
     for txn in all_txns:
         qty = float(txn["quantity"] or 0)
         if txn["txn_type"] == "purchase":
@@ -598,14 +553,8 @@ def get_item_ledger(
             running_stock += abs(qty)
         txn["running_stock"] = round(running_stock, 4)
 
-    # Reverse to DESC for display (most recent first)
-    all_txns.reverse()
-
     return {
         "item":         item,
-        "date_from":    date_from,
-        "date_to":      date_to,
-        "opening_stock": opening_stock,
         "transactions": all_txns,
         "summary": {
             "total_purchased":       sum(float(t["quantity"] or 0) for t in purchases),
@@ -798,6 +747,7 @@ def get_tag_report(
         e.g. actual_quantity='18lt' → unit_type='lt', volume=18.0
         Returns dict: unit_type → {total_volume, item_count, unit_qty_total}
         """
+        import re
         totals: dict = {}
         for row in items:
             aq  = (row.get("actual_quantity") or "").strip().lower()
