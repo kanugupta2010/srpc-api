@@ -543,8 +543,6 @@ def get_item_ledger(
         ORDER BY i.invoice_date DESC, i.id DESC
     """, [item_code, DEFAULT_COMPANY] + date_params)
 
-    cursor.close()
-
     # Merge and sort all transactions chronologically
     all_txns = purchases + purchase_returns + sales + sale_returns
     # Sort ASC first to calculate running stock correctly (oldest → newest)
@@ -552,6 +550,8 @@ def get_item_ledger(
 
     # If date-filtered, fetch opening stock (stock before date_from)
     opening_stock = 0.0
+    if not date_from:
+        cursor.close()
     if date_from:
         # Sum all transactions strictly before date_from
         cursor.execute("""
@@ -581,6 +581,8 @@ def get_item_ledger(
         sale_opening = float((row or {}).get("net_sold") or 0)
 
         opening_stock = round(purchase_opening - sale_opening, 4)
+
+    cursor.close()
 
     # Calculate running stock in chronological order, starting from opening_stock
     running_stock = opening_stock
