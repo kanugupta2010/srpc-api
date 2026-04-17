@@ -200,7 +200,7 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
                 round(eligible_amount, 2),
                 f"Sale return: {inv.bill_number}",
             ))
-            counters["points_awarded"] -= total_points
+            counters["points_awarded"] -= math.floor(total_points)
         else:
             expires_at = datetime.utcnow() + timedelta(days=expiry_days)
             cursor.execute("""
@@ -214,7 +214,7 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
                 round(eligible_amount, 2),
                 expires_at,
             ))
-            counters["points_awarded"] += total_points
+            counters["points_awarded"] += math.floor(total_points)
 
         contractor_ids_to_update.add(inv.contractor_id)
 
@@ -247,8 +247,8 @@ def _update_contractor_balance(cursor, contractor_id: int, settings: dict) -> No
             tier                  = %s
         WHERE id = %s
     """, (
-        round(total_earned, 2), round(total_redeemed, 2),
-        round(total_expired, 2), round(balance, 2),
+        math.floor(total_earned), math.floor(total_redeemed),
+        math.floor(total_expired), math.floor(balance),
         _calculate_tier(total_earned, settings),
         contractor_id,
     ))
