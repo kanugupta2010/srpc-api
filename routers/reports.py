@@ -772,13 +772,15 @@ def sales_items_report(
             im.unit,
             im.actual_quantity,
             im.bill_landing,
-            COUNT(DISTINCT i.id)                     AS voucher_count,
-            SUM(ABS(il.quantity))                    AS total_qty,
-            SUM(ABS(il.line_amount))                 AS total_amount,
+            COUNT(DISTINCT i.id)                                          AS voucher_count,
+            SUM(CASE WHEN i.invoice_type='sale_return'
+                     THEN -ABS(il.quantity) ELSE ABS(il.quantity) END)    AS total_qty,
+            SUM(CASE WHEN i.invoice_type='sale_return'
+                     THEN -ABS(il.line_amount) ELSE ABS(il.line_amount) END) AS total_amount,
             CASE WHEN SUM(ABS(il.quantity))>0
                  THEN SUM(ABS(il.line_amount))/SUM(ABS(il.quantity))
-                 ELSE 0 END                          AS avg_price,
-            MAX(i.invoice_date)                      AS last_sold
+                 ELSE 0 END                                                AS avg_price,
+            MAX(i.invoice_date)                                            AS last_sold
         FROM invoice_lines il
         JOIN invoices i ON i.id = il.invoice_id
         LEFT JOIN item_master im ON im.item_code = il.item_code AND im.company_code = i.company_code
@@ -790,9 +792,11 @@ def sales_items_report(
 
     cursor.execute(f"""
         SELECT
-            COUNT(DISTINCT il.item_code) AS item_count,
-            SUM(ABS(il.line_amount))     AS total_amount,
-            SUM(ABS(il.quantity))        AS total_qty
+            COUNT(DISTINCT il.item_code)                                    AS item_count,
+            SUM(CASE WHEN i.invoice_type='sale_return'
+                     THEN -ABS(il.line_amount) ELSE ABS(il.line_amount) END) AS total_amount,
+            SUM(CASE WHEN i.invoice_type='sale_return'
+                     THEN -ABS(il.quantity) ELSE ABS(il.quantity) END)       AS total_qty
         FROM invoice_lines il
         JOIN invoices i ON i.id = il.invoice_id
         WHERE {where}
@@ -972,14 +976,17 @@ def purchases_items_report(
             im.unit,
             im.actual_quantity,
             im.bill_landing,
-            COUNT(DISTINCT pi.id)                       AS voucher_count,
-            SUM(pl.quantity)                            AS total_qty,
-            SUM(pl.line_amount_inc)                     AS total_amount_inc,
-            SUM(pl.line_amount_exc)                     AS total_amount_exc,
-            CASE WHEN SUM(pl.quantity)>0
-                 THEN SUM(pl.line_amount_inc)/SUM(pl.quantity)
-                 ELSE 0 END                             AS avg_price_inc,
-            MAX(pi.invoice_date)                        AS last_purchased
+            COUNT(DISTINCT pi.id)                                               AS voucher_count,
+            SUM(CASE WHEN pi.invoice_type='purchase_return'
+                     THEN -ABS(pl.quantity) ELSE ABS(pl.quantity) END)         AS total_qty,
+            SUM(CASE WHEN pi.invoice_type='purchase_return'
+                     THEN -ABS(pl.line_amount_inc) ELSE ABS(pl.line_amount_inc) END) AS total_amount_inc,
+            SUM(CASE WHEN pi.invoice_type='purchase_return'
+                     THEN -ABS(pl.line_amount_exc) ELSE ABS(pl.line_amount_exc) END) AS total_amount_exc,
+            CASE WHEN SUM(ABS(pl.quantity))>0
+                 THEN SUM(ABS(pl.line_amount_inc))/SUM(ABS(pl.quantity))
+                 ELSE 0 END                                                     AS avg_price_inc,
+            MAX(pi.invoice_date)                                                AS last_purchased
         FROM purchase_lines pl
         JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
         LEFT JOIN item_master im ON im.item_code = pl.item_code AND im.company_code = pi.company_code
@@ -991,9 +998,11 @@ def purchases_items_report(
 
     cursor.execute(f"""
         SELECT
-            COUNT(DISTINCT pl.item_code) AS item_count,
-            SUM(pl.line_amount_inc)      AS total_amount_inc,
-            SUM(pl.quantity)             AS total_qty
+            COUNT(DISTINCT pl.item_code)                                            AS item_count,
+            SUM(CASE WHEN pi.invoice_type='purchase_return'
+                     THEN -ABS(pl.line_amount_inc) ELSE ABS(pl.line_amount_inc) END) AS total_amount_inc,
+            SUM(CASE WHEN pi.invoice_type='purchase_return'
+                     THEN -ABS(pl.quantity) ELSE ABS(pl.quantity) END)               AS total_qty
         FROM purchase_lines pl
         JOIN purchase_invoices pi ON pi.id = pl.purchase_invoice_id
         WHERE {where}
