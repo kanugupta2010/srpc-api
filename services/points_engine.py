@@ -7,8 +7,10 @@ Points engine:
   invoice_type = sale_return → deduct points via 'reversed' log entry
   No invoice skipping — all invoices are imported regardless of type
 
-Points base (how many rupees = 1 point unit) is read from settings table
-so it can be changed without redeployment.
+Points formula:
+  points = floor(line_amount * points_rate)
+  points_rate already encodes the base — e.g. 0.01 means 1 point per ₹100
+  Always returns a whole integer. Never round().
 """
 
 import logging
@@ -40,11 +42,12 @@ def _load_item_master(cursor) -> dict:
 
 def _calculate_points(amount: float, points_rate: float, points_base: float) -> float:
     """
-    FLOOR(abs(amount) / points_base) × points_rate
-    points_base comes from settings table (default 100)
-    e.g. amount=5400, points_rate=1.0, points_base=100 → FLOOR(54) × 1.0 = 54 points
+    Raw points contribution for a single line: abs(amount) * points_rate
+    Returns a float — do NOT floor here.
+    Floor is applied once on the invoice total after all lines are summed.
+    This avoids rounding loss per line.
     """
-    return math.floor(abs(amount) / points_base) * points_rate
+    return abs(amount) * points_rate
 
 
 def _calculate_tier(total_earned: float, settings: dict) -> str:
@@ -60,11 +63,11 @@ def process_invoices(invoices: list[ParsedInvoice], batch_id: int, db_conn) -> d
     settings    = _load_settings(cursor)
     item_master = _load_item_master(cursor)
     expiry_days  = int(settings.get("points_expiry_days", 365))
-    points_base  = float(settings.get("points_base", 100))
+    points_base  = float(settings.get("points_base", 100))  # kept for signature compat
 
     counters = dict(
         invoices_imported=0, invoices_skipped=0,
-        invoices_duplicate=0, points_awarded=0.0, errors=0,
+        invoices_duplicate=0, points_awarded=0, errors=0,
     )
     error_notes: list[str] = []
     contractor_ids_to_update: set[int] = set()
@@ -91,8 +94,6 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
                     points_base, counters, contractor_ids_to_update, error_notes):
 
     # Duplicate check
-    # With bill_number: match on bill_number + financial_year
-    # Without bill_number: match on invoice_date + particulars + invoice_type
     if inv.bill_number:
         cursor.execute(
             "SELECT id FROM invoices WHERE bill_number = %s AND financial_year = %s",
@@ -109,9 +110,9 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
         return
 
     # Calculate eligible amount and points per line
-    eligible_amount = 0.0
-    total_points    = 0.0
-    line_data       = []
+    eligible_amount  = 0.0
+    total_points_raw = 0.0   # raw float — floor applied once after all lines
+    line_data        = []
 
     for line in inv.lines:
         item_info    = item_master.get(line.item_code)
@@ -121,7 +122,7 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
         eligible_amount += line_eligible
 
         if earns_points and inv.contractor_id:
-            total_points += _calculate_points(line.line_amount, points_rate, points_base)
+            total_points_raw += _calculate_points(line.line_amount, points_rate, points_base)
 
         line_data.append((
             line.item_code, line.item_name,
@@ -129,6 +130,9 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
             line.unit_price, line.line_amount,
             earns_points, points_rate, line_eligible,
         ))
+
+    # Apply floor ONCE on invoice total (not per line — avoids rounding loss)
+    total_points = math.floor(total_points_raw)
 
     # Determine points_status
     points_status     = "not_applicable"
@@ -141,13 +145,13 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
 
     if not inv.contractor_id:
         points_status = "not_applicable"
-        total_points  = 0.0
+        total_points  = 0
     elif contractor_status != "approved":
         points_status = "pending"
-        total_points  = 0.0
+        total_points  = 0
     elif eligible_amount == 0 or total_points == 0:
         points_status = "skipped"
-        total_points  = 0.0
+        total_points  = 0
     else:
         points_status = "credited"
 
@@ -165,7 +169,7 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
         inv.party_name, inv.party_mobile or None, inv.referred_by_raw or None,
         inv.invoice_type, inv.contractor_id,
         round(inv.gross_amount, 2), round(eligible_amount, 2),
-        math.floor(total_points), points_status,
+        total_points, points_status,
         datetime.utcnow() if points_status == "credited" else None,
     ))
     invoice_id = cursor.lastrowid
@@ -196,11 +200,11 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
                 ) VALUES (%s, %s, %s, 'reversed', %s, %s, %s)
             """, (
                 inv.contractor_id, invoice_id, inv.invoice_date,
-                -math.floor(total_points),
+                -total_points,
                 round(eligible_amount, 2),
                 f"Sale return: {inv.bill_number}",
             ))
-            counters["points_awarded"] -= math.floor(total_points)
+            counters["points_awarded"] -= total_points
         else:
             expires_at = datetime.utcnow() + timedelta(days=expiry_days)
             cursor.execute("""
@@ -210,11 +214,11 @@ def _process_single(inv, batch_id, cursor, item_master, expiry_days,
                 ) VALUES (%s, %s, %s, 'earned', %s, %s, %s, 0)
             """, (
                 inv.contractor_id, invoice_id, inv.invoice_date,
-                math.floor(total_points),
+                total_points,
                 round(eligible_amount, 2),
                 expires_at,
             ))
-            counters["points_awarded"] += math.floor(total_points)
+            counters["points_awarded"] += total_points
 
         contractor_ids_to_update.add(inv.contractor_id)
 
@@ -232,10 +236,10 @@ def _update_contractor_balance(cursor, contractor_id: int, settings: dict) -> No
     """, (contractor_id,))
     row = cursor.fetchone()
 
-    total_earned      = float(row["total_earned"])
-    total_redeemed    = float(row["total_redeemed"])
-    total_expired     = float(row["total_expired"])
-    total_adjustments = float(row["total_adjustments"])
+    total_earned      = math.floor(float(row["total_earned"]))
+    total_redeemed    = math.floor(float(row["total_redeemed"]))
+    total_expired     = math.floor(float(row["total_expired"]))
+    total_adjustments = math.floor(float(row["total_adjustments"]))
     balance           = total_earned - total_redeemed - total_expired + total_adjustments
 
     cursor.execute("""
@@ -247,8 +251,8 @@ def _update_contractor_balance(cursor, contractor_id: int, settings: dict) -> No
             tier                  = %s
         WHERE id = %s
     """, (
-        math.floor(total_earned), math.floor(total_redeemed),
-        math.floor(total_expired), math.floor(balance),
+        total_earned, total_redeemed,
+        total_expired, balance,
         _calculate_tier(total_earned, settings),
         contractor_id,
     ))

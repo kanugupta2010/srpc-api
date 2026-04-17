@@ -97,11 +97,17 @@ def load_contractors(cursor) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Points formula — always returns a whole number (floor to 0 decimals)
+# Points formula — always returns a whole integer
 # ---------------------------------------------------------------------------
 
-def calculate_points(amount: float, points_rate: float, points_base: float) -> int:
-    return math.floor(math.floor(abs(amount) / points_base) * points_rate)
+def calculate_points(amount: float, points_rate: float, points_base: float = 100) -> float:
+    """
+    Raw points contribution for a single line: abs(amount) * points_rate
+    Returns a float — do NOT floor here.
+    Floor is applied once on the invoice total after all lines are summed.
+    This avoids rounding loss per line.
+    """
+    return abs(amount) * points_rate
 
 
 def calculate_tier(total_earned: float, settings: dict) -> str:
@@ -124,7 +130,7 @@ def recalculate(dry_run: bool = False) -> None:
     item_master = load_item_master(cursor)
     contractors = load_contractors(cursor)
     expiry_days  = int(settings.get("points_expiry_days", 365))
-    points_base  = float(settings.get("points_base", 100))
+    points_base  = float(settings.get("points_base", 100))  # kept but not used in formula
 
     log.info("=" * 60)
     log.info("SRPC Points Recalculation — %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -167,9 +173,9 @@ def recalculate(dry_run: bool = False) -> None:
 
     # --- Step 4: Process each invoice ---
     new_log_entries          = 0
-    total_points             = 0
-    invoice_updates          = []   # (eligible_amount, points_awarded, points_status, id)
-    line_updates             = []   # (earns_points, points_rate, eligible_amount, line_id)
+    total_points             = 0   # integer accumulator
+    invoice_updates          = []  # (eligible_amount, points_awarded, points_status, id)
+    line_updates             = []  # (earns_points, points_rate, eligible_amount, line_id)
     contractor_ids_affected: set[int] = set()
 
     for inv in invoices:
@@ -182,8 +188,8 @@ def recalculate(dry_run: bool = False) -> None:
         lines = lines_by_invoice.get(inv_id, [])
 
         # Recalculate per line using current item_master
-        eligible_amount = 0.0
-        inv_points      = 0       # integer — points are always whole numbers
+        eligible_amount  = 0.0
+        inv_points_raw   = 0.0  # raw float — floor applied once after all lines
 
         for line in lines:
             item_info    = item_master.get(line["item_code"])
@@ -193,15 +199,17 @@ def recalculate(dry_run: bool = False) -> None:
             eligible_amount += line_eligible
 
             if earns_points and contractor_id:
-                inv_points += calculate_points(float(line["line_amount"]), points_rate, points_base)
+                inv_points_raw += calculate_points(float(line["line_amount"]), points_rate, points_base)
 
-            # Queue invoice_line snapshot update
             line_updates.append((
                 earns_points,
                 points_rate,
                 round(line_eligible, 2),
                 line["id"],
             ))
+
+        # Apply floor ONCE on invoice total (not per line — avoids rounding loss)
+        inv_points = math.floor(inv_points_raw)
 
         # Determine points_status
         if not contractor_id:
@@ -218,7 +226,7 @@ def recalculate(dry_run: bool = False) -> None:
 
         invoice_updates.append((
             round(eligible_amount, 2),
-            inv_points,          # whole integer
+            inv_points,
             points_status,
             inv_id,
         ))
