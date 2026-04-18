@@ -1,33 +1,78 @@
 """Connection + transaction helper for the accounting core.
 
-Wraps the existing mysql.connector pool from database.py so we don't
-introduce a second connection mechanism. Adds:
+Owns its own mysql.connector connection lifecycle — intentionally does NOT
+share with the existing database.py module. Reasoning:
 
-- A `tx()` context manager that gives an autocommit-off connection,
-  commits on clean exit, rolls back on any exception.
-- An `OrgScopedCursor` that injects the active organization_id into
-  named-parameter dicts under the key `org_id`. Queries against
-  tenant-scoped tables MUST include `WHERE organization_id = %(org_id)s`.
+    1. The loyalty program's database.py exposes a FastAPI-dependency-style
+       generator (`yield conn`), which doesn't compose cleanly with our
+       context-manager-based transaction boundary.
+    2. Keeping the core domain's DB access isolated means future work
+       (SQLAlchemy migration in Phase E, connection pool tuning, etc.)
+       can proceed without touching the loyalty codepath.
+    3. Both modules read from the same environment variables, so they
+       connect to the same database — no duplication of config.
 
-Why this and not SQLAlchemy: per the project decision, ORM lands after
-Phase E. Until then, every core query is hand-rolled SQL using
-mysql.connector parameterized statements. The static test in
-tests/test_static_org_scope.py enforces the org_id predicate at build
-time — see that test for the enforcement contract.
+What's here:
+    * `tx()` — context manager yielding a connection in an explicit
+      transaction. Commits on clean exit, rolls back on any exception,
+      always closes (returns to the pool).
+    * `org_params(**extra)` — parameter-dict builder that always injects
+      the active organization_id under key `org_id`.
+
+A module-level connection pool is lazily created on first use. The pool
+size is intentionally small (5) because the accounting core is
+transactional and short-lived; the loyalty program has its own pool of
+10. Total pool usage stays well below MySQL's default max_connections.
 """
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 
 import mysql.connector  # type: ignore[import-untyped]
-from mysql.connector.pooling import PooledMySQLConnection  # type: ignore[import-untyped]
-
-# database.py is the existing file at /home/srpc/srpc_api/database.py.
-# It exposes get_connection() returning a PooledMySQLConnection.
-from database import get_connection as _get_connection
+from mysql.connector.pooling import (  # type: ignore[import-untyped]
+    MySQLConnectionPool,
+    PooledMySQLConnection,
+)
 
 from .tenancy import get_active_org_id
+
+_POOL: Optional[MySQLConnectionPool] = None
+
+
+def _get_pool() -> MySQLConnectionPool:
+    """Lazily create the accounting-core connection pool."""
+    global _POOL
+    if _POOL is None:
+        _POOL = MySQLConnectionPool(
+            pool_name="srpc_core_pool",
+            pool_size=5,
+            pool_reset_session=True,
+            host=os.environ["DB_HOST"],
+            port=int(os.environ.get("DB_PORT", "3306")),
+            user=os.environ["DB_USER"],
+            password=os.environ["DB_PASSWORD"],
+            database=os.environ["DB_NAME"],
+            autocommit=False,
+            use_pure=True,
+            charset="utf8mb4",
+            collation="utf8mb4_unicode_ci",
+        )
+    return _POOL
+
+
+def _acquire() -> PooledMySQLConnection:
+    """Acquire a connection from the pool, ensuring it is live."""
+    conn = _get_pool().get_connection()
+    # Pooled connections can go stale (RDS idle-close); ping forces a
+    # reconnect attempt if needed. reconnect=True, attempts=1, delay=0s.
+    try:
+        conn.ping(reconnect=True, attempts=1, delay=0)
+    except mysql.connector.Error:
+        conn.close()
+        raise
+    return conn
 
 
 @contextmanager
@@ -39,14 +84,17 @@ def tx() -> Iterator[PooledMySQLConnection]:
 
     Usage::
 
-        with tx() as conn:
+        from core.tenancy import bind_org
+        from core.db import tx
+
+        with bind_org(org_id), tx() as conn:
             cur = conn.cursor(dictionary=True)
             cur.execute("...", {"org_id": get_active_org_id(), ...})
     """
-    conn = _get_connection()
+    conn = _acquire()
     try:
-        # mysql.connector connections from a pool default to autocommit=False
-        # but be explicit; some configs flip this.
+        # Defensive: pool sets autocommit=False, but some pool resets
+        # have toggled it. Make it explicit.
         conn.autocommit = False
         conn.start_transaction()
         try:
