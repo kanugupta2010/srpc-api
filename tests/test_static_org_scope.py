@@ -48,6 +48,7 @@ from sqlparse.tokens import DML, Keyword
 # Tables that carry organization_id. Keep in sync with migrations.
 TENANT_TABLES = frozenset(
     {
+        # Phase A + B
         "account_groups",
         "ledgers",
         "parties",
@@ -55,6 +56,10 @@ TENANT_TABLES = frozenset(
         "voucher_series",
         "vouchers",
         "voucher_lines",
+        # Phase C
+        "bill_references",
+        "allocations",
+        "audit_log",
     }
 )
 

@@ -34,6 +34,12 @@ TEST_FY_CODE = "TEST"
 
 # Tables we clean up per session, in FK-safe order.
 _TENANT_TABLES_TO_CLEAN = [
+    # Phase C — must precede vouchers (allocations FK to vouchers,
+    # bill_references FK to vouchers).
+    "audit_log",
+    "allocations",
+    "bill_references",
+    # Phase A + B
     "voucher_lines",
     "vouchers",
     "voucher_series",
