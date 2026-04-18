@@ -33,3 +33,19 @@ uvicorn==0.44.0
 uvloop==0.22.1
 watchfiles==1.1.1
 websockets==16.0
+# -------------------------------------------------------------------------
+# Phase A + B additions — append to existing requirements.txt
+# -------------------------------------------------------------------------
+# Alembic drives schema migrations. Pulls SQLAlchemy as a transitive dep
+# but SQLAlchemy is NOT used in runtime application code until after
+# Phase E — this is intentional, see core/README.md.
+alembic==1.13.2
+SQLAlchemy==2.0.32
+PyMySQL==1.1.1            # Alembic driver — app code still uses mysql.connector
+
+# Static analysis for the tenant-scope test (tests/test_static_org_scope.py)
+sqlparse==0.5.1
+
+# Test tooling
+pytest==8.3.3
+hypothesis==6.112.1
